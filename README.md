@@ -1,9 +1,8 @@
 # Cairn
 
 Durable, governed, model-agnostic AI agents, written in Rust.
-```bash
-Created by **Aaron David Charles** · [charlesaarondavid.com](https://charlesaarondavid.com) · `@charlesaarondavid`
-```
+
+
 Every model call, tool call, approval and policy decision is appended to an
 event journal. Agent state is **only** a fold over that journal, so one code
 path gives you live execution, crash recovery, human-in-the-loop and
@@ -96,6 +95,10 @@ Run the Postgres tests with `CAIRN_TEST_DATABASE_URL=postgres://user@host/db car
 - [ ] Evals: replay recorded runs against new models/prompts, score, gate CI
 - [ ] Sub-agents as tools; OpenTelemetry GenAI spans
 - [ ] Python (PyO3) and TypeScript (napi-rs) bindings over the same core
+
+
+Created by **Aaron David Charles** · [charlesaarondavid.com](https://charlesaarondavid.com) · `@charlesaarondavid`
+
 
 ## License
 
