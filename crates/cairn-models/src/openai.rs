@@ -1,7 +1,10 @@
 use async_trait::async_trait;
-use cairn_runtime::{Content, Model, ModelError, ModelRequest, ModelResponse, Role, StopReason, Usage};
+use cairn_runtime::{
+    Content, Model, ModelError, ModelRequest, ModelResponse, ModelStream, Role, StopReason, StreamEvent, Usage,
+};
 use serde_json::{Value, json};
 
+use crate::sse::{self, SseEvent};
 use crate::{Pricing, merge_options, result_string, send_json};
 
 /// Chat Completions adapter for any OpenAI-compatible endpoint.
@@ -187,8 +190,144 @@ impl Model for OpenAiCompatModel {
         self.parse_response(&v)
     }
 
+    async fn stream(&self, request: &ModelRequest) -> Result<ModelStream, ModelError> {
+        let mut body = self.build_body(request);
+        body["stream"] = json!(true);
+        body["stream_options"] = json!({ "include_usage": true });
+        let mut http = self.client.post(format!("{}/chat/completions", self.base_url));
+        if let Some(key) = &self.api_key {
+            http = http.bearer_auth(key);
+        }
+        let resp = http.json(&body).send().await.map_err(|e| ModelError::Transport(e.to_string()))?;
+        let resp = sse::check_status(resp).await?;
+        let acc = StreamAcc { provider: self.provider.clone(), model: self.model.clone(), ..Default::default() };
+        Ok(sse::translate(sse::events(resp), acc, StreamAcc::step, StreamAcc::end))
+    }
+
     fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {
         self.pricing.map(|p| p.cost(&response.usage))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct StreamAcc {
+    provider: String,
+    model: String,
+    text: String,
+    reasoning: String,
+    /// (id, name, arguments) per tool-call index.
+    tools: Vec<(String, String, String)>,
+    finish: Option<String>,
+    usage: Usage,
+    done: bool,
+}
+
+impl StreamAcc {
+    pub(crate) fn step(&mut self, ev: SseEvent) -> Result<Vec<StreamEvent>, ModelError> {
+        if ev.data.trim() == "[DONE]" {
+            return self.complete();
+        }
+        let v: Value = serde_json::from_str(&ev.data).map_err(|e| ModelError::Decode(e.to_string()))?;
+        if !v["error"].is_null() {
+            let status = v["error"]["code"].as_u64().filter(|c| (400..600).contains(c)).unwrap_or(500) as u16;
+            return Err(ModelError::Api { status, body: v["error"].to_string() });
+        }
+        if let Some(m) = v["model"].as_str() {
+            self.model = m.to_owned();
+        }
+        if v["usage"].is_object() {
+            let u = &v["usage"];
+            let prompt = u["prompt_tokens"].as_u64().unwrap_or(0);
+            let cached = u["prompt_tokens_details"]["cached_tokens"].as_u64().unwrap_or(0);
+            self.usage = Usage {
+                input_tokens: prompt.saturating_sub(cached),
+                output_tokens: u["completion_tokens"].as_u64().unwrap_or(0),
+                cache_read_tokens: cached,
+                cache_write_tokens: 0,
+            };
+        }
+
+        let mut out = Vec::new();
+        let choice = &v["choices"][0];
+        let delta = &choice["delta"];
+        if let Some(r) = delta["reasoning_content"].as_str().filter(|s| !s.is_empty()) {
+            self.reasoning.push_str(r);
+            out.push(StreamEvent::ThinkingDelta(r.to_owned()));
+        }
+        if let Some(t) = delta["content"].as_str().filter(|s| !s.is_empty()) {
+            self.text.push_str(t);
+            out.push(StreamEvent::TextDelta(t.to_owned()));
+        }
+        for call in delta["tool_calls"].as_array().into_iter().flatten() {
+            let index = call["index"].as_u64().unwrap_or(self.tools.len() as u64) as usize;
+            if index >= self.tools.len() {
+                self.tools.resize(index + 1, Default::default());
+            }
+            let slot = &mut self.tools[index];
+            if let Some(id) = call["id"].as_str().filter(|s| !s.is_empty()) {
+                slot.0 = id.to_owned();
+                slot.1 = call["function"]["name"].as_str().unwrap_or_default().to_owned();
+                out.push(StreamEvent::ToolCallStart { index, id: slot.0.clone(), name: slot.1.clone() });
+            }
+            if let Some(args) = call["function"]["arguments"].as_str().filter(|s| !s.is_empty()) {
+                slot.2.push_str(args);
+                out.push(StreamEvent::ToolInputDelta { index, partial_json: args.to_owned() });
+            }
+        }
+        if let Some(f) = choice["finish_reason"].as_str() {
+            self.finish = Some(f.to_owned());
+        }
+        Ok(out)
+    }
+
+    /// Some servers close the stream without `[DONE]`; complete if they
+    /// at least sent a finish reason.
+    pub(crate) fn end(&mut self) -> Result<Vec<StreamEvent>, ModelError> {
+        if self.done {
+            Ok(Vec::new())
+        } else if self.finish.is_some() {
+            self.complete()
+        } else {
+            Err(ModelError::Transport("stream closed before completion".into()))
+        }
+    }
+
+    fn complete(&mut self) -> Result<Vec<StreamEvent>, ModelError> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        self.done = true;
+        let mut content = Vec::new();
+        if !self.reasoning.is_empty() {
+            content.push(Content::Thinking {
+                text: std::mem::take(&mut self.reasoning),
+                provider_data: Some(json!({ "provider": self.provider })),
+            });
+        }
+        if !self.text.is_empty() {
+            content.push(Content::Text { text: std::mem::take(&mut self.text) });
+        }
+        for (id, name, args) in std::mem::take(&mut self.tools) {
+            let input = if args.trim().is_empty() {
+                json!({})
+            } else {
+                serde_json::from_str(&args).unwrap_or_else(|_| json!({ "_unparsed_arguments": args }))
+            };
+            content.push(Content::ToolUse { id, name, input });
+        }
+        let stop_reason = match self.finish.as_deref() {
+            Some("stop") => StopReason::EndTurn,
+            Some("tool_calls") | Some("function_call") => StopReason::ToolUse,
+            Some("length") => StopReason::MaxTokens,
+            Some(other) => StopReason::Other(other.to_owned()),
+            None => StopReason::Other("unknown".into()),
+        };
+        Ok(vec![StreamEvent::Completed(ModelResponse {
+            model: self.model.clone(),
+            content,
+            stop_reason,
+            usage: self.usage,
+        })])
     }
 }
 
@@ -237,5 +376,42 @@ mod tests {
         assert_eq!(resp.content[0], Content::ToolUse { id: "c2".into(), name: "f".into(), input: json!({"a": 2}) });
         assert_eq!(resp.usage.input_tokens, 40);
         assert_eq!(resp.usage.cache_read_tokens, 60);
+    }
+
+    #[test]
+    fn accumulates_stream_with_parallel_tool_calls() {
+        let raw = r#"data: {"model":"gpt-x","choices":[{"index":0,"delta":{"role":"assistant","content":""}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"Check"}}]}
+
+data: {"choices":[{"index":0,"delta":{"content":"ing"}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"a","arguments":""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":1,"id":"c2","type":"function","function":{"name":"b","arguments":"{}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":20}}}
+
+data: [DONE]
+"#;
+        let mut acc = StreamAcc { provider: "openai".into(), ..Default::default() };
+        let events: Vec<StreamEvent> =
+            sse::parse_text(raw).into_iter().flat_map(|e| acc.step(e).unwrap()).collect();
+        assert_eq!(events[0], StreamEvent::TextDelta("Check".into()));
+        assert!(events.contains(&StreamEvent::ToolCallStart { index: 1, id: "c2".into(), name: "b".into() }));
+        let StreamEvent::Completed(r) = events.last().unwrap() else { panic!("no completion") };
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+        assert_eq!(r.content[0], Content::Text { text: "Checking".into() });
+        assert_eq!(r.content[1], Content::ToolUse { id: "c1".into(), name: "a".into(), input: json!({"x": 1}) });
+        assert_eq!(r.content[2], Content::ToolUse { id: "c2".into(), name: "b".into(), input: json!({}) });
+        assert_eq!(r.usage.input_tokens, 30);
+        assert_eq!(r.usage.cache_read_tokens, 20);
+        assert!(acc.end().unwrap().is_empty(), "no duplicate completion");
     }
 }

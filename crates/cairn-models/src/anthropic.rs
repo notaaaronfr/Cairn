@@ -1,7 +1,10 @@
 use async_trait::async_trait;
-use cairn_runtime::{Content, Message, Model, ModelError, ModelRequest, ModelResponse, Role, StopReason, Usage};
+use cairn_runtime::{
+    Content, Message, Model, ModelError, ModelRequest, ModelResponse, ModelStream, Role, StopReason, StreamEvent, Usage,
+};
 use serde_json::{Value, json};
 
+use crate::sse::{self, SseEvent};
 use crate::{Pricing, merge_options, result_string, send_json};
 
 const PROVIDER: &str = "anthropic";
@@ -188,8 +191,159 @@ impl Model for AnthropicModel {
         Self::parse_response(&v)
     }
 
+    async fn stream(&self, request: &ModelRequest) -> Result<ModelStream, ModelError> {
+        let mut body = self.build_body(request);
+        body["stream"] = json!(true);
+        let resp = self
+            .client
+            .post(format!("{}/v1/messages", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", &self.version)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| ModelError::Transport(e.to_string()))?;
+        let resp = sse::check_status(resp).await?;
+        Ok(sse::translate(sse::events(resp), StreamAcc::default(), StreamAcc::step, StreamAcc::end))
+    }
+
     fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {
         self.pricing.map(|p| p.cost(&response.usage))
+    }
+}
+
+enum Block {
+    Text(String),
+    Thinking { text: String, signature: String },
+    Redacted(Value),
+    Tool { id: String, name: String, json: String, index: usize },
+}
+
+#[derive(Default)]
+pub(crate) struct StreamAcc {
+    model: String,
+    blocks: Vec<Block>,
+    tools: usize,
+    usage: Usage,
+    stop_reason: Option<String>,
+}
+
+impl StreamAcc {
+    pub(crate) fn step(&mut self, ev: SseEvent) -> Result<Vec<StreamEvent>, ModelError> {
+        let v: Value = serde_json::from_str(&ev.data).map_err(|e| ModelError::Decode(e.to_string()))?;
+        let mut out = Vec::new();
+        match v["type"].as_str().unwrap_or_default() {
+            "message_start" => {
+                let m = &v["message"];
+                self.model = m["model"].as_str().unwrap_or_default().to_owned();
+                self.read_usage(&m["usage"]);
+            }
+            "content_block_start" => {
+                let b = &v["content_block"];
+                self.blocks.push(match b["type"].as_str().unwrap_or_default() {
+                    "tool_use" => {
+                        let (id, name) = (b["id"].as_str().unwrap_or_default(), b["name"].as_str().unwrap_or_default());
+                        out.push(StreamEvent::ToolCallStart { index: self.tools, id: id.into(), name: name.into() });
+                        self.tools += 1;
+                        Block::Tool { id: id.into(), name: name.into(), json: String::new(), index: self.tools - 1 }
+                    }
+                    "thinking" => Block::Thinking { text: String::new(), signature: String::new() },
+                    "redacted_thinking" => Block::Redacted(b["data"].clone()),
+                    _ => Block::Text(String::new()),
+                });
+            }
+            "content_block_delta" => {
+                let d = &v["delta"];
+                let piece = |k: &str| d[k].as_str().unwrap_or_default().to_owned();
+                match (self.blocks.last_mut(), d["type"].as_str().unwrap_or_default()) {
+                    (Some(Block::Text(t)), "text_delta") => {
+                        t.push_str(&piece("text"));
+                        out.push(StreamEvent::TextDelta(piece("text")));
+                    }
+                    (Some(Block::Thinking { text, .. }), "thinking_delta") => {
+                        text.push_str(&piece("thinking"));
+                        out.push(StreamEvent::ThinkingDelta(piece("thinking")));
+                    }
+                    (Some(Block::Thinking { signature, .. }), "signature_delta") => {
+                        signature.push_str(&piece("signature"));
+                        out.push(StreamEvent::ThinkingSignature(piece("signature")));
+                    }
+                    (Some(Block::Tool { json, index, .. }), "input_json_delta") => {
+                        json.push_str(&piece("partial_json"));
+                        out.push(StreamEvent::ToolInputDelta { index: *index, partial_json: piece("partial_json") });
+                    }
+                    _ => {}
+                }
+            }
+            "message_delta" => {
+                if let Some(r) = v["delta"]["stop_reason"].as_str() {
+                    self.stop_reason = Some(r.to_owned());
+                }
+                self.read_usage(&v["usage"]);
+            }
+            "message_stop" => out.push(StreamEvent::Completed(self.finish()?)),
+            "error" => {
+                let kind = v["error"]["type"].as_str().unwrap_or_default();
+                let status = match kind {
+                    "overloaded_error" => 529,
+                    "rate_limit_error" => 429,
+                    _ => 500,
+                };
+                return Err(ModelError::Api { status, body: v["error"].to_string() });
+            }
+            _ => {}
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn end(&mut self) -> Result<Vec<StreamEvent>, ModelError> {
+        Err(ModelError::Transport("stream closed before message_stop".into()))
+    }
+
+    fn read_usage(&mut self, u: &Value) {
+        let set = |field: &mut u64, k: &str| {
+            if let Some(n) = u[k].as_u64() {
+                *field = n;
+            }
+        };
+        set(&mut self.usage.input_tokens, "input_tokens");
+        set(&mut self.usage.output_tokens, "output_tokens");
+        set(&mut self.usage.cache_read_tokens, "cache_read_input_tokens");
+        set(&mut self.usage.cache_write_tokens, "cache_creation_input_tokens");
+    }
+
+    fn finish(&mut self) -> Result<ModelResponse, ModelError> {
+        let content = std::mem::take(&mut self.blocks)
+            .into_iter()
+            .map(|b| match b {
+                Block::Text(text) => Content::Text { text },
+                Block::Thinking { text, signature } => Content::Thinking {
+                    text,
+                    provider_data: Some(json!({ "provider": PROVIDER, "signature": signature })),
+                },
+                Block::Redacted(data) => Content::Thinking {
+                    text: String::new(),
+                    provider_data: Some(json!({ "provider": PROVIDER, "redacted_data": data })),
+                },
+                Block::Tool { id, name, json, .. } => Content::ToolUse {
+                    id,
+                    name,
+                    input: if json.trim().is_empty() { json!({}) } else { serde_json::from_str(&json).unwrap_or(json!({})) },
+                },
+            })
+            .collect();
+        let response = Self::parse_stop(self.stop_reason.as_deref());
+        Ok(ModelResponse { model: self.model.clone(), content, stop_reason: response, usage: self.usage })
+    }
+
+    fn parse_stop(r: Option<&str>) -> StopReason {
+        match r {
+            Some("end_turn") | Some("stop_sequence") => StopReason::EndTurn,
+            Some("tool_use") => StopReason::ToolUse,
+            Some("max_tokens") => StopReason::MaxTokens,
+            Some(other) => StopReason::Other(other.to_owned()),
+            None => StopReason::Other("unknown".into()),
+        }
     }
 }
 
@@ -261,5 +415,68 @@ mod tests {
         assert_eq!(r.stop_reason, StopReason::ToolUse);
         assert_eq!(r.content.len(), 3);
         assert_eq!(r.usage.cache_read_tokens, 90);
+    }
+
+    #[test]
+    fn accumulates_stream() {
+        let raw = r#"event: message_start
+data: {"type":"message_start","message":{"model":"claude-x","usage":{"input_tokens":12}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"hmm"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"sig"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}
+
+event: ping
+data: {"type":"ping"}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"Look"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ing"}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"tu1","name":"get_order","input":{}}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"id\":"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"7}"}}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":30}}
+
+event: message_stop
+data: {"type":"message_stop"}
+"#;
+        let mut acc = StreamAcc::default();
+        let events: Vec<StreamEvent> =
+            sse::parse_text(raw).into_iter().flat_map(|e| acc.step(e).unwrap()).collect();
+        assert_eq!(events[0], StreamEvent::ThinkingDelta("hmm".into()));
+        assert!(events.contains(&StreamEvent::TextDelta("Look".into())));
+        assert!(events.contains(&StreamEvent::ToolCallStart { index: 0, id: "tu1".into(), name: "get_order".into() }));
+        let StreamEvent::Completed(r) = events.last().unwrap() else { panic!("no completion") };
+        assert_eq!(r.stop_reason, StopReason::ToolUse);
+        assert_eq!(r.usage.input_tokens, 12);
+        assert_eq!(r.usage.output_tokens, 30);
+        assert_eq!(r.content[1], Content::Text { text: "Looking".into() });
+        assert_eq!(r.content[2], Content::ToolUse { id: "tu1".into(), name: "get_order".into(), input: json!({"id": 7}) });
+        assert!(matches!(&r.content[0], Content::Thinking { provider_data: Some(d), .. } if d["signature"] == "sig"));
+    }
+
+    #[test]
+    fn stream_error_event_is_retryable_when_overloaded() {
+        let mut acc = StreamAcc::default();
+        let ev = SseEvent { event: Some("error".into()), data: r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#.into() };
+        assert!(acc.step(ev).unwrap_err().retryable());
     }
 }

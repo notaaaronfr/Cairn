@@ -9,6 +9,7 @@
 mod anthropic;
 mod openai;
 mod pricing;
+mod sse;
 
 pub use anthropic::AnthropicModel;
 pub use openai::OpenAiCompatModel;

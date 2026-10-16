@@ -21,12 +21,21 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use cairn_models::Pricing;
-use cairn_runtime::{Content, Model, ModelError, ModelRequest, ModelResponse};
+use cairn_runtime::{Content, Model, ModelError, ModelRequest, ModelResponse, ModelStream, StreamEvent};
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 
 pub use config::{Config, KeyConfig};
+
+/// Writes one client wire format as server-sent events, incrementally.
+pub trait SseRenderer: Send {
+    fn start(&mut self) -> String;
+    fn delta(&mut self, event: &StreamEvent) -> String;
+    fn finish(&mut self, response: &ModelResponse) -> String;
+    fn error(&mut self, err: &GatewayError) -> String;
+}
 
 pub type ModelFactory = Arc<dyn Fn(&str) -> Result<Arc<dyn Model>, ModelError> + Send + Sync>;
 
@@ -185,45 +194,33 @@ impl Gateway {
         self.config.pricing.get(spec).map(|p| Pricing::from(*p).cost(&resp.usage)).unwrap_or(0.0)
     }
 
-    /// Authenticate, authorize, budget-check, then try each spec in order.
-    async fn complete(&self, api: &str, headers: &HeaderMap, model: &str, req: &ModelRequest, rec: &mut AuditRecord) -> Result<ModelResponse, GatewayError> {
+    /// Authenticate, authorize and budget-check; returns the key name and
+    /// the failover chain for `model`.
+    fn authorize(&self, headers: &HeaderMap, model: &str, rec: &mut AuditRecord) -> Result<(String, Vec<String>), GatewayError> {
         let key = self.authenticate(headers)?;
         rec.key = key.name.clone();
-        rec.api = api.to_owned();
         let specs = self.resolve(key, model)?;
         self.check_budget(key)?;
+        Ok((key.name.clone(), specs))
+    }
 
+    /// Walk the failover chain, calling `call` on each model until one
+    /// succeeds or a non-retryable error occurs.
+    async fn failover<T, F, Fut>(&self, specs: &[String], rec: &mut AuditRecord, call: F) -> Result<(String, T), GatewayError>
+    where
+        F: Fn(Arc<dyn Model>) -> Fut,
+        Fut: std::future::Future<Output = Result<T, ModelError>>,
+    {
         let mut last = None;
         for (i, spec) in specs.iter().enumerate() {
             // A spec that cannot even be constructed (missing credentials, unknown
             // provider) is skipped like an outage so the rest of the chain still serves.
             let (result, unavailable) = match self.model(spec) {
-                Ok(m) => (m.complete(req).await, false),
+                Ok(m) => (call(m).await, false),
                 Err(e) => (Err(e), true),
             };
             match result {
-                Ok(resp) => {
-                    let cost = self.cost(spec, &resp);
-                    let tokens = resp.usage.total();
-                    {
-                        let mut spend = self.spend.lock().unwrap();
-                        let s = spend.entry(key.name.clone()).or_default();
-                        s.usd += cost;
-                        s.tokens += tokens;
-                    }
-                    rec.served_by = Some(spec.clone());
-                    rec.cost_usd = cost;
-                    rec.tokens = tokens;
-                    rec.tool_calls = resp
-                        .content
-                        .iter()
-                        .filter_map(|c| match c {
-                            Content::ToolUse { name, .. } => Some(name.clone()),
-                            _ => None,
-                        })
-                        .collect();
-                    return Ok(resp);
-                }
+                Ok(v) => return Ok((spec.clone(), v)),
                 Err(e) if (e.retryable() || unavailable) && i + 1 < specs.len() => {
                     tracing::warn!(spec, error = %e, "upstream failed, failing over");
                     rec.failed_over.push(format!("{spec}: {e}"));
@@ -233,6 +230,44 @@ impl Gateway {
             }
         }
         Err(GatewayError::upstream(&last.unwrap_or_else(|| ModelError::Other("route has no models".into()))))
+    }
+
+    /// Charge the key and fill the audit record for a successful response.
+    fn record_success(&self, key: &str, spec: &str, resp: &ModelResponse, rec: &mut AuditRecord) {
+        let cost = self.cost(spec, resp);
+        let tokens = resp.usage.total();
+        {
+            let mut spend = self.spend.lock().unwrap();
+            let s = spend.entry(key.to_owned()).or_default();
+            s.usd += cost;
+            s.tokens += tokens;
+        }
+        rec.served_by = Some(spec.to_owned());
+        rec.cost_usd = cost;
+        rec.tokens = tokens;
+        rec.tool_calls = resp
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::ToolUse { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+    }
+
+    async fn complete(&self, headers: &HeaderMap, model: &str, req: &ModelRequest, rec: &mut AuditRecord) -> Result<ModelResponse, GatewayError> {
+        let (key, specs) = self.authorize(headers, model, rec)?;
+        let (spec, resp) = self.failover(&specs, rec, |m| async move { m.complete(req).await }).await?;
+        self.record_success(&key, &spec, &resp, rec);
+        Ok(resp)
+    }
+
+    /// Opens a stream, failing over until the first model accepts. Once
+    /// tokens flow to the client the response is committed to that model.
+    async fn open_stream(&self, headers: &HeaderMap, model: &str, req: &ModelRequest, rec: &mut AuditRecord) -> Result<(String, String, ModelStream), GatewayError> {
+        let (key, specs) = self.authorize(headers, model, rec)?;
+        let (spec, stream) = self.failover(&specs, rec, |m| async move { m.stream(req).await }).await?;
+        Ok((key, spec, stream))
     }
 
     async fn write_audit(&self, rec: &AuditRecord) {
@@ -249,14 +284,14 @@ impl Gateway {
 
 type Parse = fn(&Value) -> Result<(String, ModelRequest, bool), GatewayError>;
 type Render = fn(&str, &str, &ModelResponse) -> Value;
-type RenderStream = fn(&str, &str, &ModelResponse) -> String;
+type Renderer = fn(&str, &str, bool) -> Box<dyn SseRenderer>;
 
 struct Api {
     name: &'static str,
     id_prefix: &'static str,
     parse: Parse,
     render: Render,
-    render_stream: RenderStream,
+    renderer: Renderer,
     render_error: fn(&GatewayError) -> Value,
 }
 
@@ -265,7 +300,7 @@ const OPENAI: Api = Api {
     id_prefix: "chatcmpl-",
     parse: openai_api::parse_request,
     render: openai_api::render_response,
-    render_stream: openai_api::render_stream,
+    renderer: openai_api::SseOut::boxed,
     render_error: openai_api::render_error,
 };
 
@@ -274,11 +309,11 @@ const ANTHROPIC: Api = Api {
     id_prefix: "msg_",
     parse: anthropic_api::parse_request,
     render: anthropic_api::render_response,
-    render_stream: anthropic_api::render_stream,
+    renderer: anthropic_api::SseOut::boxed,
     render_error: anthropic_api::render_error,
 };
 
-async fn handle(gw: Arc<Gateway>, api: &Api, headers: HeaderMap, body: Value) -> Response {
+async fn handle(gw: Arc<Gateway>, api: &'static Api, headers: HeaderMap, body: Value) -> Response {
     let started = Instant::now();
     let request_id = format!("{}{}", api.id_prefix, uuid::Uuid::now_v7().simple());
     let mut rec = AuditRecord {
@@ -297,24 +332,22 @@ async fn handle(gw: Arc<Gateway>, api: &Api, headers: HeaderMap, body: Value) ->
         tool_calls: Vec::new(),
     };
 
-    let result = match (api.parse)(&body) {
-        Ok((model, req, stream)) => gw.complete(api.name, &headers, &model, &req, &mut rec).await.map(|r| (model, r, stream)),
-        Err(e) => Err(e),
+    let (model, req, stream) = match (api.parse)(&body) {
+        Ok(parsed) => parsed,
+        Err(e) => return error_response(api, &e),
     };
-    rec.duration_ms = started.elapsed().as_millis() as u64;
+    if stream {
+        return stream_response(gw, api, headers, request_id, model, req, rec, started).await;
+    }
 
+    let result = gw.complete(&headers, &model, &req, &mut rec).await;
+    rec.duration_ms = started.elapsed().as_millis() as u64;
     let response = match result {
-        Ok((model, resp, false)) => axum::Json((api.render)(&request_id, &model, &resp)).into_response(),
-        Ok((model, resp, true)) => (
-            [(header::CONTENT_TYPE, "text/event-stream"), (header::CACHE_CONTROL, "no-cache")],
-            (api.render_stream)(&request_id, &model, &resp),
-        )
-            .into_response(),
+        Ok(resp) => axum::Json((api.render)(&request_id, &model, &resp)).into_response(),
         Err(e) => {
             rec.status = e.status;
             rec.error = Some(e.message.clone());
-            let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
-            (status, axum::Json((api.render_error)(&e))).into_response()
+            error_response(api, &e)
         }
     };
     // Unauthenticated noise is not audited against any key.
@@ -322,6 +355,83 @@ async fn handle(gw: Arc<Gateway>, api: &Api, headers: HeaderMap, body: Value) ->
         gw.write_audit(&rec).await;
     }
     response
+}
+
+fn error_response(api: &Api, e: &GatewayError) -> Response {
+    let status = StatusCode::from_u16(e.status).unwrap_or(StatusCode::BAD_GATEWAY);
+    (status, axum::Json((api.render_error)(e))).into_response()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn stream_response(
+    gw: Arc<Gateway>,
+    api: &'static Api,
+    headers: HeaderMap,
+    request_id: String,
+    model: String,
+    req: ModelRequest,
+    mut rec: AuditRecord,
+    started: Instant,
+) -> Response {
+    let (key, spec, mut upstream) = match gw.open_stream(&headers, &model, &req, &mut rec).await {
+        Ok(opened) => opened,
+        Err(e) => {
+            rec.status = e.status;
+            rec.error = Some(e.message.clone());
+            rec.duration_ms = started.elapsed().as_millis() as u64;
+            if !rec.key.is_empty() {
+                gw.write_audit(&rec).await;
+            }
+            return error_response(api, &e);
+        }
+    };
+
+    let mut out = (api.renderer)(&request_id, &model, spec.starts_with("anthropic:"));
+    let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
+    tokio::spawn(async move {
+        let mut client_alive = tx.send(out.start()).await.is_ok();
+        let mut completed = false;
+        while client_alive {
+            let Some(event) = upstream.next().await else { break };
+            let chunk = match event {
+                Ok(StreamEvent::Completed(resp)) => {
+                    gw.record_success(&key, &spec, &resp, &mut rec);
+                    completed = true;
+                    out.finish(&resp)
+                }
+                Ok(delta) => out.delta(&delta),
+                Err(e) => {
+                    let err = GatewayError::upstream(&e);
+                    rec.status = err.status;
+                    rec.error = Some(err.message.clone());
+                    let _ = tx.send(out.error(&err)).await;
+                    break;
+                }
+            };
+            if !chunk.is_empty() {
+                client_alive = tx.send(chunk).await.is_ok();
+            }
+            if completed {
+                break;
+            }
+        }
+        if !completed && rec.error.is_none() {
+            rec.status = 499;
+            rec.error = Some(if client_alive { "upstream stream ended early" } else { "client disconnected" }.into());
+            rec.served_by = Some(spec.clone());
+        }
+        rec.duration_ms = started.elapsed().as_millis() as u64;
+        gw.write_audit(&rec).await;
+    });
+
+    let body = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (Ok::<_, std::convert::Infallible>(chunk), rx))
+    });
+    (
+        [(header::CONTENT_TYPE, "text/event-stream"), (header::CACHE_CONTROL, "no-cache")],
+        axum::body::Body::from_stream(body),
+    )
+        .into_response()
 }
 
 async fn openai_chat(State(gw): State<Arc<Gateway>>, headers: HeaderMap, axum::Json(body): axum::Json<Value>) -> Response {

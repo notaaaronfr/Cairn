@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::{self, BoxStream};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -93,10 +94,59 @@ pub trait Model: Send + Sync {
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError>;
 
+    /// Stream the response as it is generated. The stream always ends with
+    /// [`StreamEvent::Completed`] carrying the full response. The default
+    /// implementation calls [`Model::complete`] and replays it as deltas.
+    async fn stream(&self, request: &ModelRequest) -> Result<ModelStream, ModelError> {
+        let response = self.complete(request).await?;
+        Ok(Box::pin(stream::iter(synthesize_stream(response).into_iter().map(Ok))))
+    }
+
     /// Cost of a response in USD, if pricing is configured.
     fn cost_usd(&self, _response: &ModelResponse) -> Option<f64> {
         None
     }
+}
+
+/// Incremental output from a streaming model call.
+#[derive(Debug, Clone, PartialEq)]
+pub enum StreamEvent {
+    TextDelta(String),
+    ThinkingDelta(String),
+    /// Signature for the current thinking block (Anthropic).
+    ThinkingSignature(String),
+    /// A new tool call; `index` counts tool calls within this response.
+    ToolCallStart { index: usize, id: String, name: String },
+    ToolInputDelta { index: usize, partial_json: String },
+    /// Final event of every successful stream.
+    Completed(ModelResponse),
+}
+
+pub type ModelStream = BoxStream<'static, Result<StreamEvent, ModelError>>;
+
+/// Express a complete response as the deltas a streaming call would yield.
+pub fn synthesize_stream(response: ModelResponse) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    let mut tool_index = 0;
+    for c in &response.content {
+        match c {
+            Content::Text { text } => events.push(StreamEvent::TextDelta(text.clone())),
+            Content::Thinking { text, provider_data } => {
+                events.push(StreamEvent::ThinkingDelta(text.clone()));
+                if let Some(sig) = provider_data.as_ref().and_then(|d| d["signature"].as_str()) {
+                    events.push(StreamEvent::ThinkingSignature(sig.to_owned()));
+                }
+            }
+            Content::ToolUse { id, name, input } => {
+                events.push(StreamEvent::ToolCallStart { index: tool_index, id: id.clone(), name: name.clone() });
+                events.push(StreamEvent::ToolInputDelta { index: tool_index, partial_json: input.to_string() });
+                tool_index += 1;
+            }
+            Content::ToolResult { .. } => {}
+        }
+    }
+    events.push(StreamEvent::Completed(response));
+    events
 }
 
 /// Tries each model in order, moving on only for retryable errors.
@@ -133,6 +183,23 @@ impl Model for FallbackModel {
         Err(last_err.expect("at least one model"))
     }
 
+    /// Fails over only while opening the stream; once tokens flow, errors
+    /// are surfaced to the caller.
+    async fn stream(&self, request: &ModelRequest) -> Result<ModelStream, ModelError> {
+        let mut last_err = None;
+        for model in &self.models {
+            match model.stream(request).await {
+                Ok(s) => return Ok(s),
+                Err(e) if e.retryable() => {
+                    tracing::warn!(model = %model.id(), error = %e, "model stream failed, falling back");
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.expect("at least one model"))
+    }
+
     fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {
         self.models.iter().find(|m| m.id().ends_with(&response.model)).and_then(|m| m.cost_usd(response))
     }
@@ -146,6 +213,10 @@ impl<M: Model + ?Sized> Model for Arc<M> {
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         (**self).complete(request).await
+    }
+
+    async fn stream(&self, request: &ModelRequest) -> Result<ModelStream, ModelError> {
+        (**self).stream(request).await
     }
 
     fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {

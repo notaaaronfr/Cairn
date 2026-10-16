@@ -24,10 +24,14 @@ pub mod models {
     pub use cairn_models::*;
 }
 
+/// PostgreSQL journal (enable the `postgres` feature).
+#[cfg(feature = "postgres")]
+pub use cairn_journal_postgres::PostgresJournal;
+
 pub mod prelude {
     pub use cairn_runtime::{
         Agent, AllowAll, Budget, Content, Decision, Effect, EffectPolicy, Event, EventKind, FallbackModel,
         InMemoryJournal, Journal, JsonlJournal, Message, Model, PendingCall, Policy, RunOutcome, RunState, Status,
-        Tool, ToolCtx, ToolError, ToolSpec, tool,
+        StreamEvent, Tool, ToolCtx, ToolError, ToolSpec, tool,
     };
 }

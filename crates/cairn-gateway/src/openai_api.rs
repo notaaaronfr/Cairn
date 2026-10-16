@@ -1,9 +1,9 @@
 //! OpenAI Chat Completions wire format <-> Cairn's neutral types.
 
-use cairn_runtime::{Content, Effect, Message, ModelRequest, ModelResponse, Role, StopReason, ToolSpec};
+use cairn_runtime::{Content, Effect, Message, ModelRequest, ModelResponse, Role, StopReason, StreamEvent, ToolSpec};
 use serde_json::{Map, Value, json};
 
-use crate::GatewayError;
+use crate::{GatewayError, SseRenderer};
 
 const KNOWN: &[&str] = &[
     "model", "messages", "tools", "max_tokens", "max_completion_tokens", "temperature", "stream", "stream_options",
@@ -167,36 +167,60 @@ pub fn render_response(id: &str, model: &str, resp: &ModelResponse) -> Value {
     })
 }
 
-/// Server-sent events for a completed response (buffered streaming).
-pub fn render_stream(id: &str, model: &str, resp: &ModelResponse) -> String {
-    let created = chrono::Utc::now().timestamp();
-    let (text, calls, _) = parts(resp);
-    let chunk = |delta: Value, finish: Value, usage: Option<Value>| {
+/// Incremental Chat Completions SSE writer.
+pub struct SseOut {
+    id: String,
+    model: String,
+    created: i64,
+}
+
+impl SseOut {
+    pub fn boxed(id: &str, model: &str, _served_by_anthropic: bool) -> Box<dyn SseRenderer> {
+        Box::new(Self { id: id.into(), model: model.into(), created: chrono::Utc::now().timestamp() })
+    }
+
+    fn chunk(&self, delta: Value, finish: Value, usage: Option<Value>) -> String {
         let mut c = json!({
-            "id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+            "id": self.id, "object": "chat.completion.chunk", "created": self.created, "model": self.model,
             "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
         });
         if let Some(u) = usage {
             c["usage"] = u;
         }
         format!("data: {c}\n\n")
-    };
-    let mut delta = json!({"role": "assistant", "content": text.unwrap_or_default()});
-    if !calls.is_empty() {
-        let indexed: Vec<Value> = calls
-            .into_iter()
-            .enumerate()
-            .map(|(i, mut c)| {
-                c["index"] = json!(i);
-                c
-            })
-            .collect();
-        delta["tool_calls"] = json!(indexed);
     }
-    let mut out = chunk(delta, Value::Null, None);
-    out += &chunk(json!({}), json!(finish_reason(&resp.stop_reason)), Some(usage(resp)));
-    out += "data: [DONE]\n\n";
-    out
+}
+
+impl SseRenderer for SseOut {
+    fn start(&mut self) -> String {
+        self.chunk(json!({"role": "assistant", "content": ""}), Value::Null, None)
+    }
+
+    fn delta(&mut self, ev: &StreamEvent) -> String {
+        match ev {
+            StreamEvent::TextDelta(t) => self.chunk(json!({"content": t}), Value::Null, None),
+            StreamEvent::ThinkingDelta(t) => self.chunk(json!({"reasoning_content": t}), Value::Null, None),
+            StreamEvent::ToolCallStart { index, id, name } => self.chunk(
+                json!({"tool_calls": [{"index": index, "id": id, "type": "function", "function": {"name": name, "arguments": ""}}]}),
+                Value::Null,
+                None,
+            ),
+            StreamEvent::ToolInputDelta { index, partial_json } => self.chunk(
+                json!({"tool_calls": [{"index": index, "function": {"arguments": partial_json}}]}),
+                Value::Null,
+                None,
+            ),
+            StreamEvent::ThinkingSignature(_) | StreamEvent::Completed(_) => String::new(),
+        }
+    }
+
+    fn finish(&mut self, resp: &ModelResponse) -> String {
+        self.chunk(json!({}), json!(finish_reason(&resp.stop_reason)), Some(usage(resp))) + "data: [DONE]\n\n"
+    }
+
+    fn error(&mut self, err: &GatewayError) -> String {
+        format!("data: {}\n\n", render_error(err))
+    }
 }
 
 pub fn render_error(err: &GatewayError) -> Value {

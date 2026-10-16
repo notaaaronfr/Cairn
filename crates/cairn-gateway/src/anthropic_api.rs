@@ -1,9 +1,9 @@
 //! Anthropic Messages wire format <-> Cairn's neutral types.
 
-use cairn_runtime::{Content, Effect, Message, ModelRequest, ModelResponse, Role, StopReason, ToolSpec};
+use cairn_runtime::{Content, Effect, Message, ModelRequest, ModelResponse, Role, StopReason, StreamEvent, ToolSpec};
 use serde_json::{Map, Value, json};
 
-use crate::GatewayError;
+use crate::{GatewayError, SseRenderer};
 
 const KNOWN: &[&str] = &["model", "messages", "system", "tools", "max_tokens", "temperature", "stream"];
 
@@ -140,44 +140,113 @@ pub fn render_response(id: &str, model: &str, resp: &ModelResponse) -> Value {
     })
 }
 
-/// Server-sent events for a completed response (buffered streaming).
-pub fn render_stream(id: &str, model: &str, resp: &ModelResponse) -> String {
-    let ev = |name: &str, data: Value| format!("event: {name}\ndata: {data}\n\n");
-    let mut start = render_response(id, model, resp);
-    start["content"] = json!([]);
-    start["stop_reason"] = Value::Null;
-    let mut out = ev("message_start", json!({"type": "message_start", "message": start}));
+#[derive(Clone, Copy, PartialEq)]
+enum Block {
+    Text,
+    Thinking,
+    Tool,
+}
 
-    for (i, b) in blocks(resp).into_iter().enumerate() {
-        let (empty, delta) = match b["type"].as_str().unwrap_or_default() {
-            "text" => (json!({"type": "text", "text": ""}), json!({"type": "text_delta", "text": b["text"]})),
-            "tool_use" => (
-                json!({"type": "tool_use", "id": b["id"], "name": b["name"], "input": {}}),
-                json!({"type": "input_json_delta", "partial_json": b["input"].to_string()}),
-            ),
-            "thinking" => (
-                json!({"type": "thinking", "thinking": ""}),
-                json!({"type": "thinking_delta", "thinking": b["thinking"]}),
-            ),
-            _ => (b.clone(), Value::Null),
-        };
-        out += &ev("content_block_start", json!({"type": "content_block_start", "index": i, "content_block": empty}));
-        if !delta.is_null() {
-            out += &ev("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": delta}));
-        }
-        if b["type"] == "thinking" {
-            let sig = json!({"type": "signature_delta", "signature": b["signature"]});
-            out += &ev("content_block_delta", json!({"type": "content_block_delta", "index": i, "delta": sig}));
-        }
-        out += &ev("content_block_stop", json!({"type": "content_block_stop", "index": i}));
+/// Incremental Messages API SSE writer.
+pub struct SseOut {
+    id: String,
+    model: String,
+    /// Thinking can only be forwarded to Anthropic clients when Anthropic
+    /// produced (and signed) it.
+    thinking_ok: bool,
+    open: Option<Block>,
+    index: usize,
+}
+
+impl SseOut {
+    pub fn boxed(id: &str, model: &str, served_by_anthropic: bool) -> Box<dyn SseRenderer> {
+        Box::new(Self { id: id.into(), model: model.into(), thinking_ok: served_by_anthropic, open: None, index: 0 })
     }
-    out += &ev(
-        "message_delta",
-        json!({"type": "message_delta", "delta": {"stop_reason": stop_reason(&resp.stop_reason), "stop_sequence": null},
-               "usage": {"output_tokens": resp.usage.output_tokens}}),
-    );
-    out += &ev("message_stop", json!({"type": "message_stop"}));
-    out
+
+    fn ev(name: &str, data: Value) -> String {
+        format!("event: {name}\ndata: {data}\n\n")
+    }
+
+    fn close(&mut self) -> String {
+        match self.open.take() {
+            Some(_) => {
+                let out = Self::ev("content_block_stop", json!({"type": "content_block_stop", "index": self.index}));
+                self.index += 1;
+                out
+            }
+            None => String::new(),
+        }
+    }
+
+    fn open_block(&mut self, kind: Block, block: Value) -> String {
+        let mut out = self.close();
+        out += &Self::ev(
+            "content_block_start",
+            json!({"type": "content_block_start", "index": self.index, "content_block": block}),
+        );
+        self.open = Some(kind);
+        out
+    }
+
+    fn block_delta(&self, delta: Value) -> String {
+        Self::ev("content_block_delta", json!({"type": "content_block_delta", "index": self.index, "delta": delta}))
+    }
+}
+
+impl SseRenderer for SseOut {
+    fn start(&mut self) -> String {
+        Self::ev(
+            "message_start",
+            json!({"type": "message_start", "message": {
+                "id": self.id, "type": "message", "role": "assistant", "model": self.model, "content": [],
+                "stop_reason": null, "stop_sequence": null, "usage": {"input_tokens": 0, "output_tokens": 0},
+            }}),
+        )
+    }
+
+    fn delta(&mut self, ev: &StreamEvent) -> String {
+        match ev {
+            StreamEvent::TextDelta(t) => {
+                let mut out = String::new();
+                if self.open != Some(Block::Text) {
+                    out += &self.open_block(Block::Text, json!({"type": "text", "text": ""}));
+                }
+                out + &self.block_delta(json!({"type": "text_delta", "text": t}))
+            }
+            StreamEvent::ThinkingDelta(t) if self.thinking_ok => {
+                let mut out = String::new();
+                if self.open != Some(Block::Thinking) {
+                    out += &self.open_block(Block::Thinking, json!({"type": "thinking", "thinking": ""}));
+                }
+                out + &self.block_delta(json!({"type": "thinking_delta", "thinking": t}))
+            }
+            StreamEvent::ThinkingSignature(sig) if self.thinking_ok && self.open == Some(Block::Thinking) => {
+                self.block_delta(json!({"type": "signature_delta", "signature": sig}))
+            }
+            StreamEvent::ToolCallStart { id, name, .. } => {
+                self.open_block(Block::Tool, json!({"type": "tool_use", "id": id, "name": name, "input": {}}))
+            }
+            StreamEvent::ToolInputDelta { partial_json, .. } if self.open == Some(Block::Tool) => {
+                self.block_delta(json!({"type": "input_json_delta", "partial_json": partial_json}))
+            }
+            _ => String::new(),
+        }
+    }
+
+    fn finish(&mut self, resp: &ModelResponse) -> String {
+        let mut out = self.close();
+        out += &Self::ev(
+            "message_delta",
+            json!({"type": "message_delta",
+                   "delta": {"stop_reason": stop_reason(&resp.stop_reason), "stop_sequence": null},
+                   "usage": usage(resp)}),
+        );
+        out + &Self::ev("message_stop", json!({"type": "message_stop"}))
+    }
+
+    fn error(&mut self, err: &GatewayError) -> String {
+        Self::ev("error", render_error(err))
+    }
 }
 
 pub fn render_error(err: &GatewayError) -> Value {

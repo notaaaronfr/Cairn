@@ -9,6 +9,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+futures.workspace = true
 cairn-runtime.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true

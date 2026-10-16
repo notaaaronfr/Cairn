@@ -15,6 +15,8 @@ pub enum JournalError {
     Io(#[from] std::io::Error),
     #[error("corrupt journal entry: {0}")]
     Corrupt(String),
+    #[error("journal backend error: {0}")]
+    Backend(String),
 }
 
 /// Append-only, per-run event storage.

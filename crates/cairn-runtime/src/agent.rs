@@ -9,7 +9,9 @@ use crate::budget::Budget;
 use crate::event::{Event, EventKind};
 use crate::journal::{InMemoryJournal, Journal, JournalError};
 use crate::message::{Content, Message, content_text};
-use crate::model::{Model, ModelRequest, Usage};
+use futures::StreamExt;
+
+use crate::model::{Model, ModelError, ModelRequest, ModelResponse, StreamEvent, Usage};
 use crate::policy::{Decision, EffectPolicy, Policy};
 use crate::state::{PendingCall, RunState, Status};
 use crate::tool::{Tool, ToolCtx};
@@ -68,7 +70,10 @@ pub struct Agent {
     max_tokens: u32,
     temperature: Option<f32>,
     provider_options: BTreeMap<String, Value>,
+    on_delta: Option<DeltaFn>,
 }
+
+type DeltaFn = Arc<dyn Fn(&StreamEvent) + Send + Sync>;
 
 impl Agent {
     pub fn builder(name: impl Into<String>) -> AgentBuilder {
@@ -83,6 +88,7 @@ impl Agent {
             max_tokens: 4096,
             temperature: None,
             provider_options: BTreeMap::new(),
+            on_delta: None,
         }
     }
 
@@ -200,7 +206,11 @@ impl Agent {
         let step = state.steps + 1;
         let started = Instant::now();
 
-        match self.model.complete(&request).await {
+        let result = match &self.on_delta {
+            Some(on_delta) => self.stream_turn(&request, on_delta).await,
+            None => self.model.complete(&request).await,
+        };
+        match result {
             Ok(response) => {
                 let cost_usd = self.model.cost_usd(&response);
                 let wants_tools = response.content.iter().any(|c| matches!(c, Content::ToolUse { .. }));
@@ -218,6 +228,19 @@ impl Agent {
             }
         }
         Ok(())
+    }
+
+    /// Streams deltas to the observer. Only the completed response is
+    /// journaled, so replay and resume are identical with or without streaming.
+    async fn stream_turn(&self, request: &ModelRequest, on_delta: &DeltaFn) -> Result<ModelResponse, ModelError> {
+        let mut stream = self.model.stream(request).await?;
+        while let Some(event) = stream.next().await {
+            match event? {
+                StreamEvent::Completed(response) => return Ok(response),
+                delta => on_delta(&delta),
+            }
+        }
+        Err(ModelError::Decode("stream ended before the response completed".into()))
     }
 
     async fn handle_tool_calls(&self, state: &mut RunState) -> Result<(), AgentError> {
@@ -302,6 +325,7 @@ pub struct AgentBuilder {
     max_tokens: u32,
     temperature: Option<f32>,
     provider_options: BTreeMap<String, Value>,
+    on_delta: Option<DeltaFn>,
 }
 
 impl AgentBuilder {
@@ -357,6 +381,13 @@ impl AgentBuilder {
         self
     }
 
+    /// Stream model output as it is generated (text, thinking, tool-call
+    /// arguments). Enables streaming calls to the model.
+    pub fn on_delta(mut self, f: impl Fn(&StreamEvent) + Send + Sync + 'static) -> Self {
+        self.on_delta = Some(Arc::new(f));
+        self
+    }
+
     pub fn build(self) -> Result<Agent, AgentError> {
         let model = self.model.ok_or_else(|| AgentError::Config("a model is required".into()))?;
         let mut seen = std::collections::HashSet::new();
@@ -376,6 +407,7 @@ impl AgentBuilder {
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             provider_options: self.provider_options,
+            on_delta: self.on_delta,
         })
     }
 }

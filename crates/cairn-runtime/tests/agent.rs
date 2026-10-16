@@ -215,3 +215,29 @@ fn idempotency_key_is_stable_per_call() {
     assert_eq!(ToolCtx::new("run", "c1").idempotency_key, ToolCtx::new("run", "c1").idempotency_key);
     assert_ne!(ToolCtx::new("run", "c1").idempotency_key, ToolCtx::new("run", "c2").idempotency_key);
 }
+
+#[tokio::test]
+async fn streams_deltas_and_journals_only_completed_steps() {
+    use std::sync::Mutex;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let agent = Agent::builder("t")
+        .model(ScriptedModel::new(vec![
+            tool_call_response(&[("c1", "lookup", json!({"id": 1}))]),
+            text_response("streamed answer"),
+        ]))
+        .tool(counting_tool("lookup", Effect::Read, Arc::new(AtomicU32::new(0))))
+        .on_delta(move |e| sink.lock().unwrap().push(e.clone()))
+        .build()
+        .unwrap();
+
+    let out = agent.run("go").await.unwrap();
+    assert_eq!(out.output(), Some("streamed answer"));
+    let seen = seen.lock().unwrap().clone();
+    assert!(seen.iter().any(|e| matches!(e, StreamEvent::ToolCallStart { name, .. } if name == "lookup")));
+    assert!(seen.contains(&StreamEvent::TextDelta("streamed answer".into())));
+    assert!(!seen.iter().any(|e| matches!(e, StreamEvent::Completed(_))), "Completed is not a delta");
+
+    let events = agent.journal().load(&out.run_id).await.unwrap();
+    assert_eq!(events.iter().filter(|e| matches!(e.kind, EventKind::ModelCalled { .. })).count(), 2);
+}

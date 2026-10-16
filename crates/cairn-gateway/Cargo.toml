@@ -13,6 +13,7 @@ name = "cairn-gateway"
 path = "src/main.rs"
 
 [dependencies]
+futures.workspace = true
 cairn-runtime.workspace = true
 cairn-models.workspace = true
 axum.workspace = true
@@ -29,6 +30,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+toml.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 tempfile = "3"

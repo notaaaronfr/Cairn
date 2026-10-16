@@ -30,8 +30,8 @@ client = Anthropic(base_url="http://127.0.0.1:8787", api_key="ck_dev_support")
 ```
 
 Endpoints: `POST /v1/chat/completions`, `POST /v1/messages`, `GET /v1/models`,
-`GET /v1/cairn/usage`, `GET /healthz`. Streaming requests receive the complete response as a
-single SSE stream (true token streaming is on the roadmap).
+`GET /v1/cairn/usage`, `GET /healthz`. Streaming is true token streaming in both wire formats,
+whichever provider serves the request; failover applies until the first token is sent.
 
 ## Native framework quickstart
 
@@ -46,6 +46,19 @@ cargo run -p cairn-ai-cli -- state runs/<run_id>.jsonl --at 3   # state at event
 
 Model specs: `anthropic:…`, `openai:…`, `gemini:…`, `ollama:…`, `openrouter:…`
 (keys from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`).
+
+### Streaming and Postgres
+
+```rust
+let agent = Agent::builder("support")
+    .model(cairn::models::from_spec("anthropic:claude-opus-5-5")?)
+    .on_delta(|d| if let StreamEvent::TextDelta(t) = d { print!("{t}") })   // live tokens
+    .journal(cairn::PostgresJournal::connect(&database_url).await?)        // features = ["postgres"]
+    .build()?;
+```
+
+Run the Postgres tests with `CAIRN_TEST_DATABASE_URL=postgres://user@host/db cargo test -p cairn-journal-postgres`
+(they are skipped when the variable is unset).
 
 ## Principles
 
@@ -66,14 +79,17 @@ Model specs: `anthropic:…`, `openai:…`, `gemini:…`, `ollama:…`, `openrou
 | `cairn-models` | Anthropic (native) and OpenAI-compatible adapters (OpenAI, Gemini, Ollama, vLLM, OpenRouter…) |
 | `cairn-ai` | Facade crate users depend on (`use cairn::prelude::*`) |
 | `cairn-gateway` | Drop-in OpenAI/Anthropic-compatible gateway: budgets, allowlists, failover, audit |
+| `cairn-journal-postgres` | PostgreSQL journal: many processes/machines can drive, approve and resume the same runs |
 | `cairn-ai-cli` | `cairn show` / `cairn state` journal inspector |
 
 ## Roadmap
 
 - [x] v0.1 — durable loop, approvals, policies, budgets, JSONL journal, Anthropic + OpenAI-compat, CLI
 - [x] Gateway — OpenAI + Anthropic wire formats, any-to-any translation, budgets, failover, audit
-- [ ] True token streaming (model adapters + gateway)
-- [ ] Postgres/SQLite journal (multi-process safe) and leases for concurrent resumers
+- [x] True token streaming — native Anthropic + OpenAI-compatible streams, agent `on_delta`, gateway passthrough
+- [x] PostgreSQL journal — atomic compare-and-set appends, safe across processes and machines
+- [ ] Run leases so only one worker drives a run at a time (today: at-least-once tools + idempotency keys)
+- [ ] Gateway spend shared across replicas (Postgres-backed)
 - [ ] Parallel execution of read-only tools; per-tool timeouts and retries
 - [ ] Context engine: compaction policies, token budgets per section
 - [ ] MCP client (tools from any MCP server) with per-agent credential brokering

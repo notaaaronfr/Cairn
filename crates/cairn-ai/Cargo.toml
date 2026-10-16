@@ -14,6 +14,10 @@ name = "cairn"
 [dependencies]
 cairn-runtime.workspace = true
 cairn-models.workspace = true
+cairn-journal-postgres = { workspace = true, optional = true }
+
+[features]
+postgres = ["dep:cairn-journal-postgres"]
 
 [dev-dependencies]
 schemars.workspace = true
