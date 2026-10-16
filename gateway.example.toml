@@ -1,0 +1,32 @@
+# cairn-gateway configuration. Copy to gateway.toml and run:
+#   cargo run -p cairn-gateway -- --config gateway.toml
+# Then point any OpenAI- or Anthropic-compatible client at http://127.0.0.1:8787/v1
+
+listen = "127.0.0.1:8787"
+audit_log = "runs/gateway-audit.jsonl"
+allow_direct_specs = false          # true = clients may request "provider:model" directly
+
+# One entry per team / app / agent. Prefer key_sha256 (cargo run -p cairn-gateway -- --hash-key <key>).
+[[keys]]
+name = "support-team"
+key = "ck_dev_support"              # development only
+budget_usd = 25.0
+models = ["smart", "fast"]          # omit to allow every route
+
+[[keys]]
+name = "data-team"
+key_sha256 = "replace-with-sha256-of-key"
+budget_tokens = 50_000_000
+
+# Route aliases -> ordered failover chains of provider:model specs.
+# Providers: anthropic, openai, gemini, openrouter, ollama (keys read from env).
+[routes]
+smart = ["anthropic:claude-opus-5-5", "openai:gpt-5"]
+fast  = ["anthropic:claude-haiku-5-5", "gemini:gemini-2.5-flash"]
+local = ["ollama:llama3.3"]
+
+# USD per million tokens. Needed for USD budgets. Fill in from your providers'
+# current price sheets — Cairn deliberately ships no hardcoded prices.
+# [pricing."anthropic:claude-opus-5-5"]
+# input = 0.0
+# output = 0.0

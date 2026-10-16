@@ -1,0 +1,22 @@
+[package]
+name = "cairn-ai"
+description = "Durable, governed, model-agnostic agents in Rust."
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "cairn"
+
+[dependencies]
+cairn-runtime.workspace = true
+cairn-models.workspace = true
+
+[dev-dependencies]
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

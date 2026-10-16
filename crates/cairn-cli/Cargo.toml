@@ -1,0 +1,18 @@
+[package]
+name = "cairn-ai-cli"
+description = "Inspect and time-travel through Cairn run journals."
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "cairn"
+path = "src/main.rs"
+
+[dependencies]
+cairn-runtime.workspace = true
+clap.workspace = true
+serde_json.workspace = true

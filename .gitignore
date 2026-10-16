@@ -1,0 +1,11 @@
+/target
+/runs
+
+# Local gateway config may contain keys; gateway.example.toml is the template.
+/gateway.toml
+
+# Private market research — not part of the public codebase.
+/research_notes
+/reports
+
+.DS_Store
