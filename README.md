@@ -44,7 +44,9 @@ cargo run -p cairn-ai-cli -- state runs/<run_id>.jsonl --at 3   # state at event
 ```
 
 Model specs: `anthropic:…`, `openai:…`, `gemini:…`, `ollama:…`, `openrouter:…`
-(keys from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`).
+(keys from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`),
+and `compat:<name>:<model>` for any OpenAI-compatible server — e.g.
+`compat:k2:IFM/K2-Horizon-375B-A23B` reads `K2_BASE_URL` and `K2_API_KEY`.
 
 ### Streaming and Postgres
 
