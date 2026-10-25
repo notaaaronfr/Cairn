@@ -19,7 +19,8 @@ key_sha256 = "replace-with-sha256-of-key"
 budget_tokens = 50_000_000
 
 # Route aliases -> ordered failover chains of provider:model specs.
-# Providers: anthropic, openai, gemini, openrouter, ollama (keys read from env).
+# Providers: anthropic, openai, gemini, openrouter, ollama (keys read from env), and
+# compat:<name>:<model> for any OpenAI-compatible server (<NAME>_BASE_URL, <NAME>_API_KEY).
 [routes]
 smart = ["anthropic:claude-opus-5-5", "openai:gpt-5"]
 fast  = ["anthropic:claude-haiku-5-5", "gemini:gemini-2.5-flash"]

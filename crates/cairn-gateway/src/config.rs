@@ -93,6 +93,19 @@ impl Config {
             if k.key.is_none() && k.key_sha256.is_none() {
                 return Err(format!("key `{}` needs `key` or `key_sha256`", k.name));
             }
+            // A USD budget silently counts unpriced models as $0 and never
+            // triggers, so refuse that configuration outright.
+            if k.budget_usd.is_some() {
+                for (route, specs) in config.routes.iter().filter(|(r, _)| k.may_use(r)) {
+                    if let Some(spec) = specs.iter().find(|s| !config.pricing.contains_key(*s)) {
+                        return Err(format!(
+                            "key `{}` has budget_usd but route `{route}` includes `{spec}`, which has no \
+                             [pricing.\"{spec}\"] entry (use input = 0.0, output = 0.0 for a free model)",
+                            k.name
+                        ));
+                    }
+                }
+            }
         }
         Ok(config)
     }

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -26,6 +26,10 @@ pub enum AgentError {
     NotAwaitingApproval { run_id: String, call_id: String },
     #[error("invalid agent configuration: {0}")]
     Config(String),
+    #[error("run `{run_id}` is being driven by `{owner}` (lease until {expires_at})")]
+    Leased { run_id: String, owner: String, expires_at: chrono::DateTime<chrono::Utc> },
+    #[error("lost the lease on run `{run_id}`; another worker may have taken over")]
+    LeaseLost { run_id: String },
 }
 
 /// Result of driving a run until it finishes or needs a human.
@@ -37,6 +41,8 @@ pub struct RunOutcome {
     pub usage: Usage,
     pub cost_usd: f64,
     pub awaiting_approval: Vec<PendingCall>,
+    /// The validated final answer, when the agent has a finish schema.
+    pub structured: Option<Value>,
 }
 
 impl RunOutcome {
@@ -55,7 +61,13 @@ impl RunOutcome {
             usage: state.usage,
             cost_usd: state.cost_usd,
             awaiting_approval: state.awaiting_approval(),
+            structured: state.structured_output.clone(),
         }
+    }
+
+    /// Deserialize the structured final answer into `T`.
+    pub fn output_as<T: serde::de::DeserializeOwned>(&self) -> Option<Result<T, serde_json::Error>> {
+        self.structured.clone().map(serde_json::from_value)
     }
 }
 
@@ -71,7 +83,59 @@ pub struct Agent {
     temperature: Option<f32>,
     provider_options: BTreeMap<String, Value>,
     on_delta: Option<DeltaFn>,
+    tool_timeout: Option<Duration>,
+    finish: Option<FinishSchema>,
+    worker_id: String,
+    lease_ttl: Duration,
 }
+
+/// Default lease length; renewed every third of it while a run is driven.
+pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
+
+/// Holds a run's lease while it is driven and renews it in the background.
+struct Lease {
+    lost: Arc<std::sync::atomic::AtomicBool>,
+    renewer: tokio::task::JoinHandle<()>,
+}
+
+impl Lease {
+    fn lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.renewer.abort();
+    }
+}
+
+/// A required shape for the run's final answer.
+struct FinishSchema {
+    schema: Value,
+    validator: jsonschema::Validator,
+    retries: u32,
+}
+
+impl FinishSchema {
+    /// The validated JSON, or why the answer does not satisfy the schema.
+    fn check(&self, text: &str) -> Result<Value, String> {
+        let value = crate::output::extract_json(text).ok_or_else(|| "the answer is not valid JSON".to_owned())?;
+        let errors: Vec<String> = self
+            .validator
+            .iter_errors(&value)
+            .take(5)
+            .map(|e| {
+                let path = e.instance_path().to_string();
+                if path.is_empty() { e.to_string() } else { format!("{path}: {e}") }
+            })
+            .collect();
+        if errors.is_empty() { Ok(value) } else { Err(errors.join("; ")) }
+    }
+}
+
+/// Default limit for a single tool call.
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
 type DeltaFn = Arc<dyn Fn(&StreamEvent) + Send + Sync>;
 
@@ -89,11 +153,43 @@ impl Agent {
             temperature: None,
             provider_options: BTreeMap::new(),
             on_delta: None,
+            tool_timeout: Some(DEFAULT_TOOL_TIMEOUT),
+            finish_schema: None,
+            finish_retries: 1,
+            worker_id: None,
+            lease_ttl: DEFAULT_LEASE_TTL,
         }
     }
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// A builder pre-filled with this agent's configuration, for deriving
+    /// variants (another model, journal or tool set).
+    pub fn to_builder(&self) -> AgentBuilder {
+        AgentBuilder {
+            name: self.name.clone(),
+            model: Some(self.model.clone()),
+            system: self.system.clone(),
+            tools: self.tools.clone(),
+            budget: self.budget.clone(),
+            policy: self.policy.clone(),
+            journal: self.journal.clone(),
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            provider_options: self.provider_options.clone(),
+            on_delta: self.on_delta.clone(),
+            tool_timeout: self.tool_timeout,
+            finish_schema: self.finish.as_ref().map(|f| f.schema.clone()),
+            finish_retries: self.finish.as_ref().map_or(1, |f| f.retries),
+            worker_id: Some(self.worker_id.clone()),
+            lease_ttl: self.lease_ttl,
+        }
+    }
+
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
     }
 
     pub fn journal(&self) -> &Arc<dyn Journal> {
@@ -116,15 +212,61 @@ impl Agent {
         self.journal.append(&first).await?;
         let state = RunState::from_events(std::slice::from_ref(&first)).expect("one event");
         tracing::info!(run_id = %run_id, agent = %self.name, "run started");
-        self.drive(state).await
+        self.drive_leased(state).await
     }
 
     /// Continue a run from its journal, e.g. after a crash or an approval.
     /// Completed tool calls are never re-executed; a call that was in flight
     /// during a crash runs again with the same idempotency key.
+    ///
+    /// Takes the run's lease first, so two workers never drive the same run;
+    /// the loser gets [`AgentError::Leased`].
     pub async fn resume(&self, run_id: &str) -> Result<RunOutcome, AgentError> {
-        let state = self.state(run_id).await?;
-        self.drive(state).await
+        let lease = self.take_lease(run_id).await?;
+        // Load after taking the lease so we see everything the previous holder wrote.
+        let result = match self.state(run_id).await {
+            Ok(state) => self.drive(state, &lease).await,
+            Err(e) => Err(e),
+        };
+        self.end_lease(run_id, lease).await;
+        result
+    }
+
+    async fn drive_leased(&self, state: RunState) -> Result<RunOutcome, AgentError> {
+        let run_id = state.run_id.clone();
+        let lease = self.take_lease(&run_id).await?;
+        let result = self.drive(state, &lease).await;
+        self.end_lease(&run_id, lease).await;
+        result
+    }
+
+    async fn take_lease(&self, run_id: &str) -> Result<Lease, AgentError> {
+        if let Err(holder) = self.journal.acquire_lease(run_id, &self.worker_id, self.lease_ttl).await? {
+            return Err(AgentError::Leased { run_id: run_id.to_owned(), owner: holder.owner, expires_at: holder.expires_at });
+        }
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (journal, owner, ttl, flag, id) =
+            (self.journal.clone(), self.worker_id.clone(), self.lease_ttl, lost.clone(), run_id.to_owned());
+        let renewer = tokio::spawn(async move {
+            let mut tick = tokio::time::interval((ttl / 3).max(Duration::from_millis(10)));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if !matches!(journal.renew_lease(&id, &owner, ttl).await, Ok(true)) {
+                    tracing::warn!(run_id = %id, %owner, "lost run lease");
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+        Ok(Lease { lost, renewer })
+    }
+
+    async fn end_lease(&self, run_id: &str, lease: Lease) {
+        drop(lease);
+        if let Err(e) = self.journal.release_lease(run_id, &self.worker_id).await {
+            tracing::warn!(run_id, error = %e, "could not release run lease; it will expire");
+        }
     }
 
     /// Current state of a run, rebuilt from its journal.
@@ -171,10 +313,13 @@ impl Agent {
         self.tools.iter().find(|t| t.spec().name == name)
     }
 
-    async fn drive(&self, mut state: RunState) -> Result<RunOutcome, AgentError> {
+    async fn drive(&self, mut state: RunState, lease: &Lease) -> Result<RunOutcome, AgentError> {
         loop {
             if state.status.is_terminal() {
                 return Ok(RunOutcome::from_state(&state));
+            }
+            if lease.lost() {
+                return Err(AgentError::LeaseLost { run_id: state.run_id.clone() });
             }
 
             if !state.pending.is_empty() {
@@ -195,14 +340,23 @@ impl Agent {
     }
 
     async fn model_turn(&self, state: &mut RunState) -> Result<(), AgentError> {
-        let request = ModelRequest {
-            system: self.system.clone(),
+        let mut request = ModelRequest {
+            system: self.system_prompt(),
             messages: state.messages.clone(),
             tools: self.tools.iter().map(|t| t.spec().clone()).collect(),
             max_tokens: self.max_tokens,
             temperature: self.temperature,
             provider_options: self.provider_options.clone(),
         };
+        // Shrink this step's answer limit to what the remaining budget can
+        // pay for, so one call cannot overshoot it.
+        let est_input = estimate_input_tokens(&request);
+        match self.budget.output_cap(self.max_tokens, state.usage.total(), state.cost_usd, est_input, |i, o| {
+            self.model.max_call_cost(i, o)
+        }) {
+            Ok(cap) => request.max_tokens = cap,
+            Err(reason) => return self.emit(state, EventKind::BudgetExceeded { reason }).await,
+        }
         let step = state.steps + 1;
         let started = Instant::now();
 
@@ -218,16 +372,55 @@ impl Agent {
                 let duration_ms = started.elapsed().as_millis() as u64;
                 self.emit(state, EventKind::ModelCalled { step, response, cost_usd, duration_ms }).await?;
                 if !wants_tools {
-                    self.emit(state, EventKind::RunCompleted { output: text }).await?;
+                    self.finish(state, step, text).await?;
                 }
             }
             Err(e) => {
                 let error = e.to_string();
-                self.emit(state, EventKind::ModelFailed { step, error: error.clone() }).await?;
+                let (usage, spent) = e.spent();
+                // Unpriced spend can only happen without a USD budget.
+                let cost_usd = spent.or_else(|| self.model.pricing().map(|p| p.cost(&usage)));
+                self.emit(state, EventKind::ModelFailed { step, error: error.clone(), usage, cost_usd }).await?;
                 self.emit(state, EventKind::RunFailed { error }).await?;
             }
         }
         Ok(())
+    }
+
+    /// The configured system prompt, plus — when a finish schema is set —
+    /// the instruction stating the required final-answer format. Both are
+    /// part of the request and visible in traces.
+    fn system_prompt(&self) -> Option<String> {
+        let Some(finish) = &self.finish else { return self.system.clone() };
+        let rule = format!(
+            "When you have finished, reply with only a JSON object (no other text) that matches this JSON Schema:\n{}",
+            finish.schema
+        );
+        Some(match &self.system {
+            Some(s) => format!("{s}\n\n{rule}"),
+            None => rule,
+        })
+    }
+
+    /// Complete the run, enforcing the finish schema if there is one.
+    async fn finish(&self, state: &mut RunState, step: u32, text: String) -> Result<(), AgentError> {
+        let Some(finish) = &self.finish else {
+            return self.emit(state, EventKind::RunCompleted { output: text, structured: None }).await;
+        };
+        match finish.check(&text) {
+            Ok(value) => self.emit(state, EventKind::RunCompleted { output: text, structured: Some(value) }).await,
+            Err(reason) if state.finish_rejections < finish.retries => {
+                self.emit(state, EventKind::FinishRejected { step, reason }).await
+            }
+            Err(reason) => {
+                let error = format!(
+                    "final answer did not match the finish schema after {} retr{}: {reason}",
+                    finish.retries,
+                    if finish.retries == 1 { "y" } else { "ies" }
+                );
+                self.emit(state, EventKind::RunFailed { error }).await
+            }
+        }
     }
 
     /// Streams deltas to the observer. Only the completed response is
@@ -297,10 +490,25 @@ impl Agent {
         let ctx = ToolCtx::new(&state.run_id, &call.id);
         let started = Instant::now();
         let (output, is_error) = match tool {
-            Some(tool) => match tool.call(call.input.clone(), &ctx).await {
-                Ok(v) => (v, false),
-                Err(e) => (json!({ "error": e.0 }), true),
-            },
+            Some(tool) => {
+                let limit = tool.timeout().or(self.tool_timeout);
+                let fut = tool.call(call.input.clone(), &ctx);
+                let result = match limit {
+                    Some(limit) => tokio::time::timeout(limit, fut).await.unwrap_or_else(|_| {
+                        tracing::warn!(tool = %call.name, ?limit, "tool timed out");
+                        Err(crate::tool::ToolError(format!(
+                            "tool `{}` timed out after {:.1}s and was cancelled",
+                            call.name,
+                            limit.as_secs_f64()
+                        )))
+                    }),
+                    None => fut.await,
+                };
+                match result {
+                    Ok(v) => (v, false),
+                    Err(e) => (json!({ "error": e.0 }), true),
+                }
+            }
             None => (json!({ "error": format!("unknown tool `{}`", call.name) }), true),
         };
         let kind = EventKind::ToolCompleted {
@@ -312,6 +520,15 @@ impl Agent {
         };
         self.emit(state, kind).await
     }
+}
+
+/// Conservative input-size estimate: about 3 characters per token over the
+/// serialized system prompt, messages and tool definitions.
+fn estimate_input_tokens(request: &ModelRequest) -> u64 {
+    let chars = request.system.as_deref().map_or(0, str::len)
+        + serde_json::to_string(&request.messages).map_or(0, |s| s.len())
+        + serde_json::to_string(&request.tools).map_or(0, |s| s.len());
+    (chars as u64).div_ceil(3)
 }
 
 pub struct AgentBuilder {
@@ -326,11 +543,32 @@ pub struct AgentBuilder {
     temperature: Option<f32>,
     provider_options: BTreeMap<String, Value>,
     on_delta: Option<DeltaFn>,
+    tool_timeout: Option<Duration>,
+    finish_schema: Option<Value>,
+    finish_retries: u32,
+    worker_id: Option<String>,
+    lease_ttl: Duration,
 }
 
 impl AgentBuilder {
     pub fn model(mut self, model: impl Model + 'static) -> Self {
         self.model = Some(Arc::new(model));
+        self
+    }
+
+    /// Replace the tool set.
+    pub fn replace_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub(crate) fn tool_list(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
+    /// Stop streaming deltas (e.g. for background replays).
+    pub fn without_on_delta(mut self) -> Self {
+        self.on_delta = None;
         self
     }
 
@@ -341,6 +579,12 @@ impl AgentBuilder {
 
     pub fn tool(mut self, tool: impl Tool + 'static) -> Self {
         self.tools.push(Arc::new(tool));
+        self
+    }
+
+    /// Add several tools at once (e.g. all tools from an MCP server).
+    pub fn tools<T: Tool + 'static>(mut self, tools: impl IntoIterator<Item = T>) -> Self {
+        self.tools.extend(tools.into_iter().map(|t| Arc::new(t) as Arc<dyn Tool>));
         self
     }
 
@@ -388,8 +632,79 @@ impl AgentBuilder {
         self
     }
 
+    /// Default limit for each tool call (120 s unless changed). Tools can
+    /// override it with `with_timeout`. A timed-out call is cancelled and
+    /// reported to the model as an error; the run continues.
+    pub fn tool_timeout(mut self, limit: Duration) -> Self {
+        self.tool_timeout = Some(limit);
+        self
+    }
+
+    /// Require the run's final answer to be JSON matching `schema` (JSON
+    /// Schema). The schema is added to the system prompt; an answer that does
+    /// not match gets [`finish_retries`](Self::finish_retries) corrective
+    /// retries (default 1), after which the run fails. The validated value
+    /// is available as [`RunOutcome::structured`].
+    pub fn finish_schema(mut self, schema: Value) -> Self {
+        self.finish_schema = Some(schema);
+        self
+    }
+
+    /// [`finish_schema`](Self::finish_schema) derived from a Rust type.
+    pub fn finish_as<T: schemars::JsonSchema>(self) -> Self {
+        let mut schema = serde_json::to_value(schemars::schema_for!(T)).unwrap_or(Value::Null);
+        if let Value::Object(map) = &mut schema {
+            map.remove("$schema");
+        }
+        self.finish_schema(schema)
+    }
+
+    /// Name this worker in run leases (default: a random `worker-<uuid>`).
+    pub fn worker_id(mut self, id: impl Into<String>) -> Self {
+        self.worker_id = Some(id.into());
+        self
+    }
+
+    /// How long a run lease lasts without renewal (default 60 s). A crashed
+    /// worker's runs can be taken over after this long.
+    pub fn lease_ttl(mut self, ttl: Duration) -> Self {
+        self.lease_ttl = ttl;
+        self
+    }
+
+    /// Corrective retries allowed for a final answer that fails the schema.
+    pub fn finish_retries(mut self, n: u32) -> Self {
+        self.finish_retries = n;
+        self
+    }
+
+    /// Remove the default tool timeout (per-tool timeouts still apply).
+    pub fn without_tool_timeout(mut self) -> Self {
+        self.tool_timeout = None;
+        self
+    }
+
     pub fn build(self) -> Result<Agent, AgentError> {
         let model = self.model.ok_or_else(|| AgentError::Config("a model is required".into()))?;
+        if self.budget.max_usd.is_some() {
+            let unpriced = model.unpriced_models();
+            if !unpriced.is_empty() {
+                return Err(AgentError::Config(format!(
+                    "max_usd is set but these models have no pricing, so spend could not be counted: {}. \
+                     Set pricing (e.g. Priced::new(model, Pricing::new(input, output))); \
+                     use Pricing::new(0.0, 0.0) for a model that is genuinely free",
+                    unpriced.join(", ")
+                )));
+            }
+        }
+        let finish = match self.finish_schema {
+            Some(schema) => {
+                let validator = jsonschema::validator_for(&schema)
+                    .map_err(|e| AgentError::Config(format!("invalid finish schema: {e}")))?;
+                Some(FinishSchema { schema, validator, retries: self.finish_retries })
+            }
+            None => None,
+        };
         let mut seen = std::collections::HashSet::new();
         for t in &self.tools {
             if !seen.insert(t.spec().name.clone()) {
@@ -408,6 +723,10 @@ impl AgentBuilder {
             temperature: self.temperature,
             provider_options: self.provider_options,
             on_delta: self.on_delta,
+            tool_timeout: self.tool_timeout,
+            finish,
+            worker_id: self.worker_id.unwrap_or_else(|| format!("worker-{}", uuid::Uuid::now_v7())),
+            lease_ttl: self.lease_ttl,
         })
     }
 }

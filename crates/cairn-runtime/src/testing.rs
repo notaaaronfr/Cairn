@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::message::Content;
 use crate::model::{Model, ModelError, ModelRequest, ModelResponse, StopReason, Usage};
+use crate::pricing::Pricing;
 
 /// Returns pre-scripted responses in order and records every request.
 pub struct ScriptedModel {
@@ -40,8 +41,9 @@ impl Model for ScriptedModel {
             .ok_or_else(|| ModelError::Other("scripted model has no responses left".into()))
     }
 
-    fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {
-        Some(response.usage.total() as f64 * 1e-6)
+    /// $1 per million tokens of every kind, so tests can exercise USD budgets.
+    fn pricing(&self) -> Option<Pricing> {
+        Some(Pricing { input: 1.0, output: 1.0, cache_read: 1.0, cache_write: 1.0 })
     }
 }
 
@@ -51,6 +53,7 @@ pub fn text_response(text: &str) -> ModelResponse {
         content: vec![Content::Text { text: text.into() }],
         stop_reason: StopReason::EndTurn,
         usage: Usage { input_tokens: 100, output_tokens: 20, ..Default::default() },
+        ..Default::default()
     }
 }
 
@@ -63,5 +66,6 @@ pub fn tool_call_response(calls: &[(&str, &str, Value)]) -> ModelResponse {
             .collect(),
         stop_reason: StopReason::ToolUse,
         usage: Usage { input_tokens: 100, output_tokens: 20, ..Default::default() },
+        ..Default::default()
     }
 }

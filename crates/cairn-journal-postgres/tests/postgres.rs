@@ -137,10 +137,11 @@ async fn racing_resumers_cannot_corrupt_a_run() {
     let w2 = agent(j.clone(), vec![text_response("done")], refunds.clone());
     let (r1, r2) = tokio::join!(w1.resume(&out.run_id), w2.resume(&out.run_id));
 
+    // The lease admits one driver; the other is told who holds it (or, if it
+    // arrives after the run finished, sees the finished run).
     let ok = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
-    let conflicts =
-        [&r1, &r2].iter().filter(|r| matches!(r, Err(AgentError::Journal(JournalError::Conflict { .. })))).count();
-    assert_eq!(ok + conflicts, 2, "{r1:?} {r2:?}");
+    let leased = [&r1, &r2].iter().filter(|r| matches!(r, Err(AgentError::Leased { .. }))).count();
+    assert_eq!(ok + leased, 2, "{r1:?} {r2:?}");
     assert!(ok >= 1);
 
     // Whatever the interleaving, the journal is a single consistent history.
@@ -151,7 +152,23 @@ async fn racing_resumers_cannot_corrupt_a_run() {
     let state = RunState::from_events(&events).unwrap();
     assert_eq!(state.status, Status::Completed { output: "done".into() });
     assert_eq!(events.iter().filter(|e| matches!(e.kind, EventKind::ToolCompleted { .. })).count(), 1);
-    // At-least-once: the losing worker may have run the tool before losing
-    // the append. Tools must use ctx.idempotency_key for exactly-once effects.
-    assert!((1..=2).contains(&refunds.load(Ordering::SeqCst)));
+    assert_eq!(refunds.load(Ordering::SeqCst), 1, "leases make the refund run exactly once");
+}
+
+#[tokio::test]
+async fn expired_lease_is_taken_over_using_the_database_clock() {
+    let j = require_db!();
+    let run = new_run_id();
+    let ttl = std::time::Duration::from_millis(200);
+    assert!(j.acquire_lease(&run, "crashed", ttl).await.unwrap().is_ok());
+    let held = j.acquire_lease(&run, "b", ttl).await.unwrap().unwrap_err();
+    assert_eq!(held.owner, "crashed");
+    assert!(j.renew_lease(&run, "crashed", ttl).await.unwrap());
+    assert!(!j.renew_lease(&run, "b", ttl).await.unwrap(), "only the holder can renew");
+
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(j.acquire_lease(&run, "b", ttl).await.unwrap().is_ok(), "expired lease is taken over");
+    assert!(!j.renew_lease(&run, "crashed", ttl).await.unwrap(), "the old holder has lost it");
+    j.release_lease(&run, "b").await.unwrap();
+    assert!(j.acquire_lease(&run, "c", ttl).await.unwrap().is_ok());
 }

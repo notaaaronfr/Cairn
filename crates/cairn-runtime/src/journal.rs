@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
 
 use async_trait::async_trait;
 use tokio::io::AsyncWriteExt;
@@ -19,7 +22,19 @@ pub enum JournalError {
     Backend(String),
 }
 
+/// Who currently holds a run's lease.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeaseHolder {
+    pub owner: String,
+    pub expires_at: DateTime<Utc>,
+}
+
 /// Append-only, per-run event storage.
+///
+/// Journals may also implement run leases so that only one worker drives a
+/// run at a time. The defaults grant every lease (no coordination), which is
+/// correct for single-worker setups; sequence checks still prevent corrupt
+/// histories either way.
 ///
 /// Implementations must reject an append whose `seq` is not exactly the next
 /// position; this is what makes concurrent resumers safe.
@@ -27,11 +42,64 @@ pub enum JournalError {
 pub trait Journal: Send + Sync {
     async fn append(&self, event: &Event) -> Result<(), JournalError>;
     async fn load(&self, run_id: &str) -> Result<Vec<Event>, JournalError>;
+
+    /// Take (or re-take) the lease on `run_id` for `ttl`. Returns the current
+    /// holder if another live owner has it.
+    async fn acquire_lease(&self, _run_id: &str, _owner: &str, _ttl: Duration) -> Result<Result<(), LeaseHolder>, JournalError> {
+        Ok(Ok(()))
+    }
+
+    /// Extend a lease this owner holds. `false` means it was lost.
+    async fn renew_lease(&self, _run_id: &str, _owner: &str, _ttl: Duration) -> Result<bool, JournalError> {
+        Ok(true)
+    }
+
+    async fn release_lease(&self, _run_id: &str, _owner: &str) -> Result<(), JournalError> {
+        Ok(())
+    }
+}
+
+/// In-process lease table shared by the built-in journals.
+#[derive(Default)]
+struct Leases(std::sync::Mutex<HashMap<String, (String, Instant)>>);
+
+impl Leases {
+    fn acquire(&self, run_id: &str, owner: &str, ttl: Duration) -> Result<(), LeaseHolder> {
+        let mut map = self.0.lock().unwrap();
+        let now = Instant::now();
+        if let Some((holder, until)) = map.get(run_id) {
+            if holder != owner && *until > now {
+                let left = chrono::Duration::from_std(*until - now).unwrap_or_default();
+                return Err(LeaseHolder { owner: holder.clone(), expires_at: Utc::now() + left });
+            }
+        }
+        map.insert(run_id.to_owned(), (owner.to_owned(), now + ttl));
+        Ok(())
+    }
+
+    fn renew(&self, run_id: &str, owner: &str, ttl: Duration) -> bool {
+        let mut map = self.0.lock().unwrap();
+        match map.get_mut(run_id) {
+            Some((holder, until)) if holder == owner => {
+                *until = Instant::now() + ttl;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn release(&self, run_id: &str, owner: &str) {
+        let mut map = self.0.lock().unwrap();
+        if map.get(run_id).is_some_and(|(holder, _)| holder == owner) {
+            map.remove(run_id);
+        }
+    }
 }
 
 #[derive(Default)]
 pub struct InMemoryJournal {
     runs: Mutex<HashMap<String, Vec<Event>>>,
+    leases: Leases,
 }
 
 impl InMemoryJournal {
@@ -56,6 +124,19 @@ impl Journal for InMemoryJournal {
     async fn load(&self, run_id: &str) -> Result<Vec<Event>, JournalError> {
         Ok(self.runs.lock().await.get(run_id).cloned().unwrap_or_default())
     }
+
+    async fn acquire_lease(&self, run_id: &str, owner: &str, ttl: Duration) -> Result<Result<(), LeaseHolder>, JournalError> {
+        Ok(self.leases.acquire(run_id, owner, ttl))
+    }
+
+    async fn renew_lease(&self, run_id: &str, owner: &str, ttl: Duration) -> Result<bool, JournalError> {
+        Ok(self.leases.renew(run_id, owner, ttl))
+    }
+
+    async fn release_lease(&self, run_id: &str, owner: &str) -> Result<(), JournalError> {
+        self.leases.release(run_id, owner);
+        Ok(())
+    }
 }
 
 /// One JSON-lines file per run, fsynced on every append.
@@ -65,13 +146,15 @@ impl Journal for InMemoryJournal {
 pub struct JsonlJournal {
     dir: PathBuf,
     next_seq: Mutex<HashMap<String, u64>>,
+    /// Leases are in-process only, like the sequence checks.
+    leases: Leases,
 }
 
 impl JsonlJournal {
     pub fn new(dir: impl Into<PathBuf>) -> Result<Self, JournalError> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir, next_seq: Mutex::new(HashMap::new()) })
+        Ok(Self { dir, next_seq: Mutex::new(HashMap::new()), leases: Leases::default() })
     }
 
     pub fn path_for(&self, run_id: &str) -> PathBuf {
@@ -124,5 +207,18 @@ impl Journal for JsonlJournal {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(e) => Err(e.into()),
         }
+    }
+
+    async fn acquire_lease(&self, run_id: &str, owner: &str, ttl: Duration) -> Result<Result<(), LeaseHolder>, JournalError> {
+        Ok(self.leases.acquire(run_id, owner, ttl))
+    }
+
+    async fn renew_lease(&self, run_id: &str, owner: &str, ttl: Duration) -> Result<bool, JournalError> {
+        Ok(self.leases.renew(run_id, owner, ttl))
+    }
+
+    async fn release_lease(&self, run_id: &str, owner: &str) -> Result<(), JournalError> {
+        self.leases.release(run_id, owner);
+        Ok(())
     }
 }

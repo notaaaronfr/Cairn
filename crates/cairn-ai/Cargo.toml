@@ -15,9 +15,11 @@ name = "cairn"
 cairn-runtime.workspace = true
 cairn-models.workspace = true
 cairn-journal-postgres = { workspace = true, optional = true }
+cairn-ai-mcp = { workspace = true, optional = true }
 
 [features]
 postgres = ["dep:cairn-journal-postgres"]
+mcp = ["dep:cairn-ai-mcp"]
 
 [dev-dependencies]
 schemars.workspace = true

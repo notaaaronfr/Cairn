@@ -160,13 +160,22 @@ impl Gateway {
         if !key.may_use(model) {
             return Err(GatewayError::forbidden(format!("key `{}` may not use `{model}`", key.name)));
         }
-        if let Some(specs) = self.config.routes.get(model) {
-            return Ok(specs.clone());
+        let specs = if let Some(specs) = self.config.routes.get(model) {
+            specs.clone()
+        } else if self.config.allow_direct_specs && model.contains(':') {
+            vec![model.to_owned()]
+        } else {
+            return Err(GatewayError::not_found(format!("unknown model `{model}`")));
+        };
+        if key.budget_usd.is_some() {
+            if let Some(spec) = specs.iter().find(|s| !self.config.pricing.contains_key(*s)) {
+                return Err(GatewayError::forbidden(format!(
+                    "`{spec}` has no pricing, so key `{}`'s USD budget could not be enforced",
+                    key.name
+                )));
+            }
         }
-        if self.config.allow_direct_specs && model.contains(':') {
-            return Ok(vec![model.to_owned()]);
-        }
-        Err(GatewayError::not_found(format!("unknown model `{model}`")))
+        Ok(specs)
     }
 
     fn check_budget(&self, key: &KeyConfig) -> Result<(), GatewayError> {

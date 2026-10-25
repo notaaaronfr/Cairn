@@ -39,6 +39,15 @@ fast = ["up:model"]
 [pricing."up:model"]
 input = 10.0
 output = 10.0
+
+# Never serve successfully, but team-a has a USD budget, so they must be priced.
+[pricing."down:model"]
+input = 10.0
+output = 10.0
+
+[pricing."missing:model"]
+input = 10.0
+output = 10.0
 "#;
 
 async fn start(responses: Vec<ModelResponse>, audit: &std::path::Path) -> (String, Arc<Gateway>) {
@@ -337,4 +346,37 @@ async fn true_streaming_across_formats_with_billing() {
     assert_eq!(rec["tokens"], 200);
     assert_eq!(rec["tool_calls"][0], "get_order");
     assert!((gw.spend("team-a").usd - 0.0002).abs() < 1e-12);
+}
+
+#[test]
+fn usd_budget_with_unpriced_route_is_rejected_at_load() {
+    let bad = r#"
+[[keys]]
+name = "k"
+key = "x"
+budget_usd = 5.0
+
+[routes]
+cheap = ["compat:k2:K2"]
+"#;
+    let err = Config::from_toml(bad).unwrap_err();
+    assert!(err.contains("compat:k2:K2") && err.contains("no [pricing"), "{err}");
+
+    let free = format!("{bad}\n[pricing.\"compat:k2:K2\"]\ninput = 0.0\noutput = 0.0\n");
+    assert!(Config::from_toml(&free).is_ok(), "an explicitly free model is allowed");
+}
+
+#[tokio::test]
+async fn usd_budget_key_cannot_request_unpriced_direct_spec() {
+    let dir = tempfile::tempdir().unwrap();
+    let (base, _gw) = start(vec![text_response("x")], &dir.path().join("a.jsonl")).await;
+    // team-a has budget_usd; "unpriced:model" has no pricing entry.
+    let (status, body) = post(
+        &format!("{base}/v1/chat/completions"),
+        "ck_a",
+        json!({"model": "unpriced:model", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(body["error"]["message"].as_str().unwrap().contains("no pricing"));
 }

@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::marker::PhantomData;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use schemars::JsonSchema;
@@ -63,6 +64,11 @@ impl ToolError {
 pub trait Tool: Send + Sync {
     fn spec(&self) -> &ToolSpec;
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<Value, ToolError>;
+
+    /// Overrides the agent's default tool timeout for this tool.
+    fn timeout(&self) -> Option<Duration> {
+        None
+    }
 }
 
 /// Builds a typed tool from an async function. The JSON schema shown to the
@@ -90,6 +96,7 @@ where
     FnTool {
         spec: ToolSpec { name: name.to_owned(), description: description.to_owned(), input_schema: schema, effect },
         f,
+        timeout: None,
         _marker: PhantomData,
     }
 }
@@ -97,7 +104,17 @@ where
 pub struct FnTool<I, O, F> {
     spec: ToolSpec,
     f: F,
+    timeout: Option<Duration>,
     _marker: PhantomData<fn(I) -> O>,
+}
+
+impl<I, O, F> FnTool<I, O, F> {
+    /// Cancel this tool if it runs longer than `limit`; the model receives
+    /// an error result and the run continues.
+    pub fn with_timeout(mut self, limit: Duration) -> Self {
+        self.timeout = Some(limit);
+        self
+    }
 }
 
 #[async_trait]
@@ -110,6 +127,10 @@ where
 {
     fn spec(&self) -> &ToolSpec {
         &self.spec
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        self.timeout
     }
 
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<Value, ToolError> {

@@ -9,6 +9,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono.workspace = true
 cairn-runtime.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true

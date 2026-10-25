@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::message::Message;
-use crate::model::ModelResponse;
+use crate::model::{ModelResponse, Usage};
 
 /// One immutable fact in a run's history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +33,11 @@ pub enum EventKind {
     ModelFailed {
         step: u32,
         error: String,
+        /// Tokens already paid for before the failure (e.g. rejected answers).
+        #[serde(default)]
+        usage: Usage,
+        #[serde(default)]
+        cost_usd: Option<f64>,
     },
     ToolDenied {
         call_id: String,
@@ -63,6 +68,14 @@ pub enum EventKind {
     },
     RunCompleted {
         output: String,
+        /// The validated final answer, when the agent has a finish schema.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured: Option<Value>,
+    },
+    /// A final answer failed the finish schema; the model is asked again.
+    FinishRejected {
+        step: u32,
+        reason: String,
     },
     RunFailed {
         error: String,
@@ -81,6 +94,7 @@ impl EventKind {
             EventKind::ToolCompleted { .. } => "tool_completed",
             EventKind::BudgetExceeded { .. } => "budget_exceeded",
             EventKind::RunCompleted { .. } => "run_completed",
+            EventKind::FinishRejected { .. } => "finish_rejected",
             EventKind::RunFailed { .. } => "run_failed",
         }
     }

@@ -8,12 +8,11 @@
 
 mod anthropic;
 mod openai;
-mod pricing;
 mod sse;
 
 pub use anthropic::AnthropicModel;
 pub use openai::OpenAiCompatModel;
-pub use pricing::Pricing;
+pub use cairn_runtime::{Priced, Pricing};
 
 use std::sync::Arc;
 
@@ -29,6 +28,12 @@ use cairn_runtime::{Model, ModelError};
 /// | `gemini:`    | `GEMINI_API_KEY`    | Gemini OpenAI-compatible endpoint         |
 /// | `ollama:`    | —                   | `OLLAMA_BASE_URL` or localhost:11434      |
 /// | `openrouter:`| `OPENROUTER_API_KEY`| openrouter.ai                             |
+/// | `compat:<name>:` | `<NAME>_API_KEY` (optional) | `<NAME>_BASE_URL` (required)  |
+///
+/// `compat:` reaches any OpenAI-compatible server: `compat:k2:IFM/K2-Horizon-375B-A23B`
+/// reads `K2_BASE_URL` and `K2_API_KEY`, and its [`Model::id`] is
+/// `k2:IFM/K2-Horizon-375B-A23B`. `<NAME>` is the name upper-cased with
+/// non-alphanumeric characters replaced by `_`.
 pub fn from_spec(spec: &str) -> Result<Arc<dyn Model>, ModelError> {
     let (provider, model) =
         spec.split_once(':').ok_or_else(|| ModelError::Other(format!("expected `provider:model`, got `{spec}`")))?;
@@ -38,6 +43,16 @@ pub fn from_spec(spec: &str) -> Result<Arc<dyn Model>, ModelError> {
         "openai" => Arc::new(OpenAiCompatModel::openai(model, key("OPENAI_API_KEY")?)),
         "gemini" => Arc::new(OpenAiCompatModel::gemini(model, key("GEMINI_API_KEY")?)),
         "openrouter" => Arc::new(OpenAiCompatModel::openrouter(model, key("OPENROUTER_API_KEY")?)),
+        "compat" => {
+            let (name, model) = model
+                .split_once(':')
+                .filter(|(n, m)| !n.is_empty() && !m.is_empty())
+                .ok_or_else(|| ModelError::Other(format!("expected `compat:<name>:<model>`, got `{spec}`")))?;
+            let prefix = env_prefix(name);
+            let base = key(&format!("{prefix}_BASE_URL"))?;
+            let api_key = std::env::var(format!("{prefix}_API_KEY")).ok().filter(|k| !k.is_empty());
+            Arc::new(OpenAiCompatModel::new(name, model, base, api_key))
+        }
         "ollama" => {
             let base = std::env::var("OLLAMA_BASE_URL").unwrap_or_else(|_| "http://localhost:11434/v1".into());
             Arc::new(OpenAiCompatModel::new("ollama", model, base, None))
@@ -45,6 +60,10 @@ pub fn from_spec(spec: &str) -> Result<Arc<dyn Model>, ModelError> {
         other => return Err(ModelError::Other(format!("unknown provider `{other}`"))),
     };
     Ok(model)
+}
+
+fn env_prefix(name: &str) -> String {
+    name.chars().map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' }).collect()
 }
 
 pub(crate) async fn send_json(
@@ -72,5 +91,24 @@ pub(crate) fn result_string(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::String(s) => s.clone(),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_prefix_normalizes_names() {
+        assert_eq!(env_prefix("k2"), "K2");
+        assert_eq!(env_prefix("my-vllm.prod"), "MY_VLLM_PROD");
+    }
+
+    #[test]
+    fn compat_spec_errors_are_actionable() {
+        let err = from_spec("compat:k2").err().unwrap().to_string();
+        assert!(err.contains("compat:<name>:<model>"), "{err}");
+        let err = from_spec("compat:cairn_unset_zz:m").err().unwrap().to_string();
+        assert!(err.contains("CAIRN_UNSET_ZZ_BASE_URL is not set"), "{err}");
     }
 }
