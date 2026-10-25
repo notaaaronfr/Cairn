@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::{Value, json};
@@ -71,7 +71,11 @@ pub struct Agent {
     temperature: Option<f32>,
     provider_options: BTreeMap<String, Value>,
     on_delta: Option<DeltaFn>,
+    tool_timeout: Option<Duration>,
 }
+
+/// Default limit for a single tool call.
+pub const DEFAULT_TOOL_TIMEOUT: Duration = Duration::from_secs(120);
 
 type DeltaFn = Arc<dyn Fn(&StreamEvent) + Send + Sync>;
 
@@ -89,6 +93,7 @@ impl Agent {
             temperature: None,
             provider_options: BTreeMap::new(),
             on_delta: None,
+            tool_timeout: Some(DEFAULT_TOOL_TIMEOUT),
         }
     }
 
@@ -297,10 +302,25 @@ impl Agent {
         let ctx = ToolCtx::new(&state.run_id, &call.id);
         let started = Instant::now();
         let (output, is_error) = match tool {
-            Some(tool) => match tool.call(call.input.clone(), &ctx).await {
-                Ok(v) => (v, false),
-                Err(e) => (json!({ "error": e.0 }), true),
-            },
+            Some(tool) => {
+                let limit = tool.timeout().or(self.tool_timeout);
+                let fut = tool.call(call.input.clone(), &ctx);
+                let result = match limit {
+                    Some(limit) => tokio::time::timeout(limit, fut).await.unwrap_or_else(|_| {
+                        tracing::warn!(tool = %call.name, ?limit, "tool timed out");
+                        Err(crate::tool::ToolError(format!(
+                            "tool `{}` timed out after {:.1}s and was cancelled",
+                            call.name,
+                            limit.as_secs_f64()
+                        )))
+                    }),
+                    None => fut.await,
+                };
+                match result {
+                    Ok(v) => (v, false),
+                    Err(e) => (json!({ "error": e.0 }), true),
+                }
+            }
             None => (json!({ "error": format!("unknown tool `{}`", call.name) }), true),
         };
         let kind = EventKind::ToolCompleted {
@@ -326,6 +346,7 @@ pub struct AgentBuilder {
     temperature: Option<f32>,
     provider_options: BTreeMap<String, Value>,
     on_delta: Option<DeltaFn>,
+    tool_timeout: Option<Duration>,
 }
 
 impl AgentBuilder {
@@ -388,6 +409,20 @@ impl AgentBuilder {
         self
     }
 
+    /// Default limit for each tool call (120 s unless changed). Tools can
+    /// override it with `with_timeout`. A timed-out call is cancelled and
+    /// reported to the model as an error; the run continues.
+    pub fn tool_timeout(mut self, limit: Duration) -> Self {
+        self.tool_timeout = Some(limit);
+        self
+    }
+
+    /// Remove the default tool timeout (per-tool timeouts still apply).
+    pub fn without_tool_timeout(mut self) -> Self {
+        self.tool_timeout = None;
+        self
+    }
+
     pub fn build(self) -> Result<Agent, AgentError> {
         let model = self.model.ok_or_else(|| AgentError::Config("a model is required".into()))?;
         if self.budget.max_usd.is_some() {
@@ -419,6 +454,7 @@ impl AgentBuilder {
             temperature: self.temperature,
             provider_options: self.provider_options,
             on_delta: self.on_delta,
+            tool_timeout: self.tool_timeout,
         })
     }
 }

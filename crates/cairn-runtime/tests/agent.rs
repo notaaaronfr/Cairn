@@ -320,3 +320,42 @@ async fn fallback_prices_the_model_that_served() {
     // 120 tokens at $10/Mtok on the serving model, not $1000/Mtok (the max).
     assert!((out.cost_usd - 0.0012).abs() < 1e-12, "{}", out.cost_usd);
 }
+
+#[tokio::test]
+async fn hung_tool_times_out_and_run_continues() {
+    use std::time::{Duration, Instant};
+    let hang = tool("fetch_page", "Fetch a page", Effect::Read, |_i: Id, _ctx| async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(json!("never"))
+    })
+    .with_timeout(Duration::from_millis(50));
+    let slow_default = tool("slow", "Slow", Effect::Read, |_i: Id, _ctx| async move {
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        Ok(json!("never"))
+    });
+
+    let model = Arc::new(ScriptedModel::new(vec![
+        tool_call_response(&[("c1", "fetch_page", json!({"id": 1})), ("c2", "slow", json!({"id": 2}))]),
+        text_response("page was unreachable"),
+    ]));
+    let agent = Agent::builder("t")
+        .model(model.clone())
+        .tool(hang)
+        .tool(slow_default)
+        .tool_timeout(Duration::from_millis(80)) // agent default, used by `slow`
+        .build()
+        .unwrap();
+
+    let started = Instant::now();
+    let out = agent.run("go").await.unwrap();
+    assert!(started.elapsed() < Duration::from_secs(2), "took {:?}", started.elapsed());
+    assert_eq!(out.output(), Some("page was unreachable"));
+
+    let requests = model.requests();
+    let results = &requests[1].messages.last().unwrap().content;
+    for (r, name) in results.iter().zip(["fetch_page", "slow"]) {
+        let Content::ToolResult { content, is_error, .. } = r else { panic!("not a tool result") };
+        assert!(*is_error);
+        assert!(content["error"].as_str().unwrap().contains(&format!("`{name}` timed out")), "{content}");
+    }
+}
