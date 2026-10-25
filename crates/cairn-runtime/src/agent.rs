@@ -26,6 +26,10 @@ pub enum AgentError {
     NotAwaitingApproval { run_id: String, call_id: String },
     #[error("invalid agent configuration: {0}")]
     Config(String),
+    #[error("run `{run_id}` is being driven by `{owner}` (lease until {expires_at})")]
+    Leased { run_id: String, owner: String, expires_at: chrono::DateTime<chrono::Utc> },
+    #[error("lost the lease on run `{run_id}`; another worker may have taken over")]
+    LeaseLost { run_id: String },
 }
 
 /// Result of driving a run until it finishes or needs a human.
@@ -81,6 +85,29 @@ pub struct Agent {
     on_delta: Option<DeltaFn>,
     tool_timeout: Option<Duration>,
     finish: Option<FinishSchema>,
+    worker_id: String,
+    lease_ttl: Duration,
+}
+
+/// Default lease length; renewed every third of it while a run is driven.
+pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
+
+/// Holds a run's lease while it is driven and renews it in the background.
+struct Lease {
+    lost: Arc<std::sync::atomic::AtomicBool>,
+    renewer: tokio::task::JoinHandle<()>,
+}
+
+impl Lease {
+    fn lost(&self) -> bool {
+        self.lost.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        self.renewer.abort();
+    }
 }
 
 /// A required shape for the run's final answer.
@@ -129,6 +156,8 @@ impl Agent {
             tool_timeout: Some(DEFAULT_TOOL_TIMEOUT),
             finish_schema: None,
             finish_retries: 1,
+            worker_id: None,
+            lease_ttl: DEFAULT_LEASE_TTL,
         }
     }
 
@@ -154,7 +183,13 @@ impl Agent {
             tool_timeout: self.tool_timeout,
             finish_schema: self.finish.as_ref().map(|f| f.schema.clone()),
             finish_retries: self.finish.as_ref().map_or(1, |f| f.retries),
+            worker_id: Some(self.worker_id.clone()),
+            lease_ttl: self.lease_ttl,
         }
+    }
+
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
     }
 
     pub fn journal(&self) -> &Arc<dyn Journal> {
@@ -177,15 +212,61 @@ impl Agent {
         self.journal.append(&first).await?;
         let state = RunState::from_events(std::slice::from_ref(&first)).expect("one event");
         tracing::info!(run_id = %run_id, agent = %self.name, "run started");
-        self.drive(state).await
+        self.drive_leased(state).await
     }
 
     /// Continue a run from its journal, e.g. after a crash or an approval.
     /// Completed tool calls are never re-executed; a call that was in flight
     /// during a crash runs again with the same idempotency key.
+    ///
+    /// Takes the run's lease first, so two workers never drive the same run;
+    /// the loser gets [`AgentError::Leased`].
     pub async fn resume(&self, run_id: &str) -> Result<RunOutcome, AgentError> {
-        let state = self.state(run_id).await?;
-        self.drive(state).await
+        let lease = self.take_lease(run_id).await?;
+        // Load after taking the lease so we see everything the previous holder wrote.
+        let result = match self.state(run_id).await {
+            Ok(state) => self.drive(state, &lease).await,
+            Err(e) => Err(e),
+        };
+        self.end_lease(run_id, lease).await;
+        result
+    }
+
+    async fn drive_leased(&self, state: RunState) -> Result<RunOutcome, AgentError> {
+        let run_id = state.run_id.clone();
+        let lease = self.take_lease(&run_id).await?;
+        let result = self.drive(state, &lease).await;
+        self.end_lease(&run_id, lease).await;
+        result
+    }
+
+    async fn take_lease(&self, run_id: &str) -> Result<Lease, AgentError> {
+        if let Err(holder) = self.journal.acquire_lease(run_id, &self.worker_id, self.lease_ttl).await? {
+            return Err(AgentError::Leased { run_id: run_id.to_owned(), owner: holder.owner, expires_at: holder.expires_at });
+        }
+        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (journal, owner, ttl, flag, id) =
+            (self.journal.clone(), self.worker_id.clone(), self.lease_ttl, lost.clone(), run_id.to_owned());
+        let renewer = tokio::spawn(async move {
+            let mut tick = tokio::time::interval((ttl / 3).max(Duration::from_millis(10)));
+            tick.tick().await;
+            loop {
+                tick.tick().await;
+                if !matches!(journal.renew_lease(&id, &owner, ttl).await, Ok(true)) {
+                    tracing::warn!(run_id = %id, %owner, "lost run lease");
+                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                    return;
+                }
+            }
+        });
+        Ok(Lease { lost, renewer })
+    }
+
+    async fn end_lease(&self, run_id: &str, lease: Lease) {
+        drop(lease);
+        if let Err(e) = self.journal.release_lease(run_id, &self.worker_id).await {
+            tracing::warn!(run_id, error = %e, "could not release run lease; it will expire");
+        }
     }
 
     /// Current state of a run, rebuilt from its journal.
@@ -232,10 +313,13 @@ impl Agent {
         self.tools.iter().find(|t| t.spec().name == name)
     }
 
-    async fn drive(&self, mut state: RunState) -> Result<RunOutcome, AgentError> {
+    async fn drive(&self, mut state: RunState, lease: &Lease) -> Result<RunOutcome, AgentError> {
         loop {
             if state.status.is_terminal() {
                 return Ok(RunOutcome::from_state(&state));
+            }
+            if lease.lost() {
+                return Err(AgentError::LeaseLost { run_id: state.run_id.clone() });
             }
 
             if !state.pending.is_empty() {
@@ -462,6 +546,8 @@ pub struct AgentBuilder {
     tool_timeout: Option<Duration>,
     finish_schema: Option<Value>,
     finish_retries: u32,
+    worker_id: Option<String>,
+    lease_ttl: Duration,
 }
 
 impl AgentBuilder {
@@ -573,6 +659,19 @@ impl AgentBuilder {
         self.finish_schema(schema)
     }
 
+    /// Name this worker in run leases (default: a random `worker-<uuid>`).
+    pub fn worker_id(mut self, id: impl Into<String>) -> Self {
+        self.worker_id = Some(id.into());
+        self
+    }
+
+    /// How long a run lease lasts without renewal (default 60 s). A crashed
+    /// worker's runs can be taken over after this long.
+    pub fn lease_ttl(mut self, ttl: Duration) -> Self {
+        self.lease_ttl = ttl;
+        self
+    }
+
     /// Corrective retries allowed for a final answer that fails the schema.
     pub fn finish_retries(mut self, n: u32) -> Self {
         self.finish_retries = n;
@@ -626,6 +725,8 @@ impl AgentBuilder {
             on_delta: self.on_delta,
             tool_timeout: self.tool_timeout,
             finish,
+            worker_id: self.worker_id.unwrap_or_else(|| format!("worker-{}", uuid::Uuid::now_v7())),
+            lease_ttl: self.lease_ttl,
         })
     }
 }

@@ -58,6 +58,10 @@ let agent = Agent::builder("support")
     .build()?;
 ```
 
+With several workers, each run is driven by one worker at a time: `resume` takes a lease (renewed
+in the background, 60 s by default via `.lease_ttl(..)`), other workers get `AgentError::Leased`, and a
+crashed worker's runs can be taken over once its lease expires. Postgres leases use the database clock.
+
 Run the Postgres tests with `CAIRN_TEST_DATABASE_URL=postgres://user@host/db cargo test -p cairn-journal-postgres`
 (they are skipped when the variable is unset).
 
@@ -149,7 +153,7 @@ in-memory journal.
 - [x] Gateway — OpenAI + Anthropic wire formats, any-to-any translation, budgets, failover, audit
 - [x] True token streaming — native Anthropic + OpenAI-compatible streams, agent `on_delta`, gateway passthrough
 - [x] PostgreSQL journal — atomic compare-and-set appends, safe across processes and machines
-- [ ] Run leases so only one worker drives a run at a time (today: at-least-once tools + idempotency keys)
+- [x] Run leases — one worker drives a run at a time; renewed while running, taken over after a crash
 - [ ] Gateway spend shared across replicas (Postgres-backed)
 - [x] Budget hardening — USD budgets require pricing; per-step answer limit fits the remaining budget
 - [x] Usability-checked fallback (truncated / empty / bad JSON → next model), paid attempts still counted

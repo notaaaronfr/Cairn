@@ -785,3 +785,90 @@ mod evals {
         assert_eq!(report.pass_rate(0.5), 0.0);
     }
 }
+
+mod leases {
+    use super::*;
+    use std::time::Duration;
+
+    fn worker(name: &str, journal: Arc<dyn Journal>, refunds: Arc<AtomicU32>, responses: Vec<ModelResponse>) -> Agent {
+        let refund = tool("refund", "Refund", Effect::Irreversible, move |_i: Id, _ctx| {
+            let refunds = refunds.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(150)).await; // long enough to overlap
+                refunds.fetch_add(1, Ordering::SeqCst);
+                Ok(json!("ok"))
+            }
+        });
+        Agent::builder("support").model(ScriptedModel::new(responses)).tool(refund).shared_journal(journal).worker_id(name).build().unwrap()
+    }
+
+    #[tokio::test]
+    async fn only_one_worker_drives_a_run() {
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let refunds = Arc::new(AtomicU32::new(0));
+        let a = worker("a", journal.clone(), refunds.clone(), vec![
+            tool_call_response(&[("r1", "refund", json!({"id": 1}))]),
+            text_response("done"),
+        ]);
+        let b = worker("b", journal.clone(), refunds.clone(), vec![text_response("done")]);
+
+        let out = a.run("refund").await.unwrap();
+        a.decide(&out.run_id, "r1", true, None, None).await.unwrap();
+        let (ra, rb) = tokio::join!(a.resume(&out.run_id), b.resume(&out.run_id));
+
+        assert_eq!(refunds.load(Ordering::SeqCst), 1, "the refund ran exactly once");
+        let (won, lost) = if ra.is_ok() { (ra, rb) } else { (rb, ra) };
+        assert_eq!(won.unwrap().output(), Some("done"));
+        assert!(matches!(lost, Err(AgentError::Leased { .. })), "{lost:?}");
+
+        // The lease is released when the run is done.
+        assert!(journal.acquire_lease(&out.run_id, "someone-else", Duration::from_secs(1)).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn crashed_workers_lease_expires_and_another_takes_over() {
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let refunds = Arc::new(AtomicU32::new(0));
+        let a = worker("a", journal.clone(), refunds.clone(), vec![tool_call_response(&[("r1", "refund", json!({"id": 1}))])]);
+        let out = a.run("refund").await.unwrap();
+        a.decide(&out.run_id, "r1", true, None, None).await.unwrap();
+
+        // Worker "crashed" took the lease and died without releasing it.
+        journal.acquire_lease(&out.run_id, "crashed", Duration::from_millis(60)).await.unwrap().unwrap();
+        let b = worker("b", journal.clone(), refunds.clone(), vec![text_response("recovered")]);
+        let err = b.resume(&out.run_id).await.unwrap_err();
+        assert!(matches!(&err, AgentError::Leased { owner, .. } if owner == "crashed"), "{err}");
+
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert_eq!(b.resume(&out.run_id).await.unwrap().output(), Some("recovered"));
+        assert_eq!(refunds.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn long_runs_keep_their_lease_by_renewing() {
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let refunds = Arc::new(AtomicU32::new(0));
+        // 30ms lease, 150ms tool: without renewal the lease would expire mid-call.
+        let a = worker("a", journal.clone(), refunds.clone(), vec![
+            tool_call_response(&[("r1", "refund", json!({"id": 1}))]),
+            text_response("done"),
+        ])
+        .to_builder()
+        .lease_ttl(Duration::from_millis(30))
+        .build()
+        .unwrap();
+        let b = worker("b", journal.clone(), refunds.clone(), vec![text_response("stolen")]);
+
+        let out = a.run("refund").await.unwrap();
+        a.decide(&out.run_id, "r1", true, None, None).await.unwrap();
+        let run_id = out.run_id.clone();
+        let driving = tokio::spawn(async move { a.resume(&run_id).await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await; // > 3 lease lengths in
+        let err = b.resume(&out.run_id).await.unwrap_err();
+        assert!(matches!(&err, AgentError::Leased { owner, .. } if owner == "a"), "{err}");
+
+        assert_eq!(driving.await.unwrap().unwrap().output(), Some("done"));
+        assert_eq!(refunds.load(Ordering::SeqCst), 1);
+    }
+}

@@ -24,7 +24,7 @@ pub mod tool;
 pub use agent::{Agent, AgentBuilder, AgentError, RunOutcome};
 pub use budget::Budget;
 pub use event::{Event, EventKind};
-pub use journal::{InMemoryJournal, Journal, JournalError, JsonlJournal};
+pub use journal::{InMemoryJournal, Journal, JournalError, JsonlJournal, LeaseHolder};
 pub use message::{Content, Message, Role};
 pub use model::{
     FallbackModel, Model, ModelError, ModelRequest, ModelResponse, ModelStream, RejectedAttempt, StopReason, StreamEvent,
