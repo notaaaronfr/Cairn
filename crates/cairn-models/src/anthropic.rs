@@ -139,7 +139,7 @@ impl AnthropicModel {
                 cache_read_tokens: n("cache_read_input_tokens"),
                 cache_write_tokens: n("cache_creation_input_tokens"),
             },
-            served_by: None,
+            ..Default::default()
         })
     }
 }
@@ -334,7 +334,7 @@ impl StreamAcc {
             })
             .collect();
         let response = Self::parse_stop(self.stop_reason.as_deref());
-        Ok(ModelResponse { model: self.model.clone(), content, stop_reason: response, usage: self.usage, served_by: None })
+        Ok(ModelResponse { model: self.model.clone(), content, stop_reason: response, usage: self.usage, ..Default::default() })
     }
 
     fn parse_stop(r: Option<&str>) -> StopReason {

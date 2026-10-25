@@ -359,3 +359,144 @@ async fn hung_tool_times_out_and_run_continues() {
         assert!(content["error"].as_str().unwrap().contains(&format!("`{name}` timed out")), "{content}");
     }
 }
+
+mod usable_fallback {
+    use super::*;
+
+    /// A ScriptedModel with its own id and price, standing in for K2 or Haiku.
+    struct Named {
+        id: &'static str,
+        inner: ScriptedModel,
+        price: f64,
+    }
+
+    #[async_trait::async_trait]
+    impl Model for Named {
+        fn id(&self) -> String {
+            self.id.into()
+        }
+        async fn complete(&self, r: &ModelRequest) -> Result<ModelResponse, ModelError> {
+            self.inner.complete(r).await
+        }
+        fn pricing(&self) -> Option<Pricing> {
+            Some(Pricing::new(self.price, self.price))
+        }
+    }
+
+    fn k2(responses: Vec<ModelResponse>) -> Arc<Named> {
+        Arc::new(Named { id: "k2:K2", inner: ScriptedModel::new(responses), price: 0.0 })
+    }
+    fn haiku(responses: Vec<ModelResponse>) -> Arc<Named> {
+        Arc::new(Named { id: "anthropic:haiku", inner: ScriptedModel::new(responses), price: 10.0 })
+    }
+
+    fn truncated(text: &str) -> ModelResponse {
+        ModelResponse { stop_reason: StopReason::MaxTokens, ..text_response(text) }
+    }
+
+    async fn run(chain: FallbackModel) -> (Agent, RunOutcome) {
+        let agent = Agent::builder("t").model(chain).budget(Budget::default().max_usd(1.0)).build().unwrap();
+        let out = agent.run("go").await.unwrap();
+        (agent, out)
+    }
+
+    async fn first_model_call(agent: &Agent, run_id: &str) -> ModelResponse {
+        let events = agent.journal().load(run_id).await.unwrap();
+        events
+            .into_iter()
+            .find_map(|e| match e.kind {
+                EventKind::ModelCalled { response, .. } => Some(response),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn truncated_reply_falls_back_and_is_still_paid_for() {
+        let (k, h) = (k2(vec![truncated("The handoff is: {\"summ")]), haiku(vec![text_response("complete answer")]));
+        let (agent, out) = run(FallbackModel::new(vec![k, h.clone()])).await;
+        assert_eq!(out.output(), Some("complete answer"));
+
+        let resp = first_model_call(&agent, &out.run_id).await;
+        assert_eq!(resp.served_by.as_deref(), Some("anthropic:haiku"));
+        assert_eq!(resp.rejected.len(), 1);
+        assert_eq!(resp.rejected[0].model, "k2:K2");
+        assert!(resp.rejected[0].reason.contains("cut off"));
+        // Both attempts' tokens are counted; only Haiku's cost money.
+        assert_eq!(out.usage.total(), 240);
+        assert!((out.cost_usd - 120.0 * 10.0 / 1e6).abs() < 1e-12, "{}", out.cost_usd);
+    }
+
+    #[tokio::test]
+    async fn empty_reply_falls_back() {
+        let (k, h) = (k2(vec![text_response("   ")]), haiku(vec![text_response("real answer")]));
+        let (_, out) = run(FallbackModel::new(vec![k, h])).await;
+        assert_eq!(out.output(), Some("real answer"));
+    }
+
+    #[tokio::test]
+    async fn bad_or_incomplete_json_falls_back_good_json_is_kept() {
+        let fields = ["summary", "work", "risks", "confidence"];
+        let partial = text_response(r#"{"summary": "done", "work": "x"}"#);
+        let good = text_response(r#"```json
+{"summary": "s", "work": "w", "risks": ["r"], "confidence": 0.8}
+```"#);
+
+        let (agent, out) =
+            run(FallbackModel::new(vec![k2(vec![partial]), haiku(vec![good.clone()])]).require_json_fields(&fields)).await;
+        let resp = first_model_call(&agent, &out.run_id).await;
+        assert!(resp.rejected[0].reason.contains("missing required field(s): risks, confidence"), "{:?}", resp.rejected);
+        assert_eq!(resp.served_by.as_deref(), Some("anthropic:haiku"));
+
+        // When K2 gets it right, Haiku is never called.
+        let h = haiku(vec![]);
+        let (_, out) = run(FallbackModel::new(vec![k2(vec![good]), h.clone()]).require_json_fields(&fields)).await;
+        assert!(out.output().is_some());
+        assert!(h.inner.requests().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_call_turns_are_not_held_to_the_json_rule() {
+        let k = k2(vec![tool_call_response(&[("c1", "lookup", json!({"id": 1}))]), text_response(r#"{"summary":"s"}"#)]);
+        let chain = FallbackModel::new(vec![k, haiku(vec![])]).require_json_fields(&["summary"]);
+        let agent = Agent::builder("t")
+            .model(chain)
+            .tool(counting_tool("lookup", Effect::Read, Arc::new(AtomicU32::new(0))))
+            .build()
+            .unwrap();
+        let out = agent.run("go").await.unwrap();
+        assert_eq!(out.output(), Some(r#"{"summary":"s"}"#));
+    }
+
+    #[tokio::test]
+    async fn all_unusable_fails_the_run_but_keeps_the_spend() {
+        let (k, h) = (k2(vec![text_response("")]), haiku(vec![truncated("abc")]));
+        let (agent, out) = run(FallbackModel::new(vec![k, h])).await;
+        let Status::Failed { error } = &out.status else { panic!("{:?}", out.status) };
+        assert!(error.contains("k2:K2: reply is empty") && error.contains("anthropic:haiku: reply was cut off"), "{error}");
+        assert_eq!(out.usage.total(), 240);
+        assert!(out.cost_usd > 0.0);
+        let state = agent.state(&out.run_id).await.unwrap();
+        assert_eq!(state.cost_usd, out.cost_usd);
+    }
+
+    #[tokio::test]
+    async fn streaming_never_leaks_a_rejected_answer() {
+        use std::sync::Mutex;
+        let seen = Arc::new(Mutex::new(String::new()));
+        let sink = seen.clone();
+        let chain = FallbackModel::new(vec![k2(vec![truncated("BAD PARTIAL")]), haiku(vec![text_response("good")])]);
+        let agent = Agent::builder("t")
+            .model(chain)
+            .on_delta(move |e| {
+                if let StreamEvent::TextDelta(t) = e {
+                    sink.lock().unwrap().push_str(t);
+                }
+            })
+            .build()
+            .unwrap();
+        let out = agent.run("go").await.unwrap();
+        assert_eq!(out.output(), Some("good"));
+        assert_eq!(*seen.lock().unwrap(), "good");
+    }
+}

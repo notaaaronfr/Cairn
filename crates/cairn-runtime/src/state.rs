@@ -88,7 +88,7 @@ impl RunState {
             }
             EventKind::ModelCalled { response, cost_usd, .. } => {
                 self.steps += 1;
-                self.usage.add(&response.usage);
+                self.usage.add(&response.total_usage());
                 self.cost_usd += cost_usd.unwrap_or(0.0);
                 self.messages.push(Message::assistant(response.content.clone()));
                 self.pending = response
@@ -105,7 +105,10 @@ impl RunState {
                     })
                     .collect();
             }
-            EventKind::ModelFailed { .. } => {}
+            EventKind::ModelFailed { usage, cost_usd, .. } => {
+                self.usage.add(usage);
+                self.cost_usd += cost_usd.unwrap_or(0.0);
+            }
             EventKind::ToolDenied { call_id, reason, .. } => {
                 self.resolve(call_id, json!({ "error": format!("tool call denied: {reason}") }), true);
             }

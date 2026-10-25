@@ -13,6 +13,7 @@ pub mod event;
 pub mod journal;
 pub mod message;
 pub mod model;
+pub mod output;
 pub mod policy;
 pub mod pricing;
 pub mod state;
@@ -25,7 +26,8 @@ pub use event::{Event, EventKind};
 pub use journal::{InMemoryJournal, Journal, JournalError, JsonlJournal};
 pub use message::{Content, Message, Role};
 pub use model::{
-    FallbackModel, Model, ModelError, ModelRequest, ModelResponse, ModelStream, StopReason, StreamEvent, Usage,
+    FallbackModel, Model, ModelError, ModelRequest, ModelResponse, ModelStream, RejectedAttempt, StopReason, StreamEvent,
+    Usage,
     synthesize_stream,
 };
 pub use policy::{AllowAll, Decision, EffectPolicy, Policy};

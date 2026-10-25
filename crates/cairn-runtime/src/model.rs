@@ -68,6 +68,30 @@ pub struct ModelResponse {
     /// composite model (e.g. [`FallbackModel`]) chose among several.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub served_by: Option<String>,
+    /// Earlier answers in this call that were discarded as unusable. Their
+    /// tokens were still paid for and count toward budgets.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<RejectedAttempt>,
+}
+
+/// A model answer that was received, paid for, and discarded.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RejectedAttempt {
+    pub model: String,
+    pub reason: String,
+    pub usage: Usage,
+    pub cost_usd: Option<f64>,
+}
+
+impl ModelResponse {
+    /// Tokens for this response plus any rejected attempts.
+    pub fn total_usage(&self) -> Usage {
+        let mut u = self.usage;
+        for r in &self.rejected {
+            u.add(&r.usage);
+        }
+        u
+    }
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -78,6 +102,9 @@ pub enum ModelError {
     Api { status: u16, body: String },
     #[error("could not decode provider response: {0}")]
     Decode(String),
+    /// Every model answered, but no answer passed the usability check.
+    #[error("no usable response: {reason}")]
+    Unusable { reason: String, attempts: Vec<RejectedAttempt> },
     #[error("{0}")]
     Other(String),
 }
@@ -89,6 +116,23 @@ impl ModelError {
             ModelError::Transport(_) => true,
             ModelError::Api { status, .. } => *status == 408 || *status == 429 || *status >= 500,
             _ => false,
+        }
+    }
+
+    /// Tokens and USD already spent before this error (e.g. on answers that
+    /// were rejected as unusable). `cost` is `None` if any attempt was unpriced.
+    pub fn spent(&self) -> (Usage, Option<f64>) {
+        match self {
+            ModelError::Unusable { attempts, .. } => {
+                let mut usage = Usage::default();
+                let mut cost = Some(0.0);
+                for a in attempts {
+                    usage.add(&a.usage);
+                    cost = cost.zip(a.cost_usd).map(|(x, y)| x + y);
+                }
+                (usage, cost)
+            }
+            _ => (Usage::default(), Some(0.0)),
         }
     }
 }
@@ -166,15 +210,87 @@ pub fn synthesize_stream(response: ModelResponse) -> Vec<StreamEvent> {
     events
 }
 
-/// Tries each model in order, moving on only for retryable errors.
+type UsableFn = Arc<dyn Fn(&ModelResponse) -> Result<(), String> + Send + Sync>;
+
+/// Tries each model in order. Moves on when a request fails with a
+/// retryable error **or** when the answer is unusable:
+///
+/// * cut off by the token limit (unless [`accept_truncated`](Self::accept_truncated)),
+/// * empty — no text and no tool calls (unless [`accept_empty`](Self::accept_empty)),
+/// * a final answer that is not JSON with the required fields
+///   ([`require_json_fields`](Self::require_json_fields)),
+/// * rejected by a custom check ([`require`](Self::require)).
+///
+/// Rejected answers are recorded in [`ModelResponse::rejected`] and their
+/// cost still counts toward budgets. With usability checks enabled,
+/// streaming is buffered per attempt so a rejected answer never reaches
+/// the caller.
 pub struct FallbackModel {
     models: Vec<Arc<dyn Model>>,
+    allow_truncated: bool,
+    allow_empty: bool,
+    json_fields: Option<Vec<String>>,
+    custom: Option<UsableFn>,
 }
 
 impl FallbackModel {
     pub fn new(models: Vec<Arc<dyn Model>>) -> Self {
         assert!(!models.is_empty(), "FallbackModel needs at least one model");
-        Self { models }
+        Self { models, allow_truncated: false, allow_empty: false, json_fields: None, custom: None }
+    }
+
+    /// Keep answers that hit the token limit.
+    pub fn accept_truncated(mut self) -> Self {
+        self.allow_truncated = true;
+        self
+    }
+
+    /// Keep answers with no text and no tool calls.
+    pub fn accept_empty(mut self) -> Self {
+        self.allow_empty = true;
+        self
+    }
+
+    /// Final answers (no tool calls) must contain a JSON object with these
+    /// top-level fields, e.g. `["summary", "work", "risks", "confidence"]`.
+    pub fn require_json_fields(mut self, fields: &[&str]) -> Self {
+        self.json_fields = Some(fields.iter().map(|f| (*f).to_owned()).collect());
+        self
+    }
+
+    /// Custom usability check; return `Err(reason)` to try the next model.
+    pub fn require(mut self, check: impl Fn(&ModelResponse) -> Result<(), String> + Send + Sync + 'static) -> Self {
+        self.custom = Some(Arc::new(check));
+        self
+    }
+
+    fn has_checks(&self) -> bool {
+        !self.allow_truncated || !self.allow_empty || self.json_fields.is_some() || self.custom.is_some()
+    }
+
+    /// Why a response is unusable, if it is.
+    pub fn check(&self, r: &ModelResponse) -> Result<(), String> {
+        if !self.allow_truncated && r.stop_reason == StopReason::MaxTokens {
+            return Err("reply was cut off at the token limit".into());
+        }
+        let has_tools = r.content.iter().any(|c| matches!(c, Content::ToolUse { .. }));
+        let text = crate::message::content_text(&r.content);
+        if !self.allow_empty && !has_tools && text.trim().is_empty() {
+            return Err("reply is empty".into());
+        }
+        if let (Some(fields), false) = (&self.json_fields, has_tools) {
+            let Some(serde_json::Value::Object(obj)) = crate::output::extract_json(&text) else {
+                return Err("reply is not a JSON object".into());
+            };
+            let missing: Vec<&str> = fields.iter().filter(|f| !obj.contains_key(*f)).map(String::as_str).collect();
+            if !missing.is_empty() {
+                return Err(format!("JSON is missing required field(s): {}", missing.join(", ")));
+            }
+        }
+        if let Some(check) = &self.custom {
+            check(r)?;
+        }
+        Ok(())
     }
 }
 
@@ -187,25 +303,63 @@ impl Model for FallbackModel {
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let mut last_err = None;
+        let mut rejected: Vec<RejectedAttempt> = Vec::new();
         for model in &self.models {
             match model.complete(request).await {
                 Ok(mut resp) => {
                     resp.served_by.get_or_insert_with(|| model.id());
-                    return Ok(resp);
+                    match self.check(&resp) {
+                        Ok(()) => {
+                            rejected.append(&mut resp.rejected);
+                            resp.rejected = rejected;
+                            return Ok(resp);
+                        }
+                        Err(reason) => {
+                            tracing::warn!(model = %model.id(), %reason, "unusable answer, falling back");
+                            rejected.append(&mut resp.rejected);
+                            rejected.push(RejectedAttempt {
+                                model: model.id(),
+                                reason,
+                                usage: resp.usage,
+                                cost_usd: model.cost_usd(&resp),
+                            });
+                        }
+                    }
                 }
                 Err(e) if e.retryable() => {
                     tracing::warn!(model = %model.id(), error = %e, "model failed, falling back");
                     last_err = Some(e);
                 }
-                Err(e) => return Err(e),
+                Err(ModelError::Unusable { reason, attempts }) => {
+                    rejected.extend(attempts);
+                    last_err = Some(ModelError::Other(reason));
+                }
+                Err(e) if rejected.is_empty() => return Err(e),
+                Err(e) => {
+                    last_err = Some(e);
+                    break;
+                }
             }
         }
-        Err(last_err.expect("at least one model"))
+        if rejected.is_empty() {
+            return Err(last_err.expect("at least one model"));
+        }
+        // Keep the paid-for attempts on the error so budgets still see them.
+        let mut reason = rejected.iter().map(|r| format!("{}: {}", r.model, r.reason)).collect::<Vec<_>>().join("; ");
+        if let Some(e) = last_err {
+            reason = format!("{reason}; last error: {e}");
+        }
+        Err(ModelError::Unusable { reason, attempts: rejected })
     }
 
     /// Fails over only while opening the stream; once tokens flow, errors
     /// are surfaced to the caller.
     async fn stream(&self, request: &ModelRequest) -> Result<ModelStream, ModelError> {
+        if self.has_checks() {
+            // An answer must be validated before any of it is released.
+            let response = self.complete(request).await?;
+            return Ok(Box::pin(stream::iter(synthesize_stream(response).into_iter().map(Ok))));
+        }
         let mut last_err = None;
         for model in &self.models {
             match model.stream(request).await {
@@ -237,12 +391,18 @@ impl Model for FallbackModel {
 
     /// Prices the response with the model that actually served it; falls
     /// back to the conservative maximum rather than ever under-counting.
+    /// Cost of the answer (priced on the model that served it, else the
+    /// conservative maximum) plus every rejected attempt.
     fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {
         let served = response.served_by.as_deref();
-        match self.models.iter().find(|m| Some(m.id().as_str()) == served) {
-            Some(m) => m.cost_usd(response),
+        let answer = match self.models.iter().find(|m| Some(m.id().as_str()) == served) {
+            Some(m) => m.cost_usd(&ModelResponse { rejected: Vec::new(), ..response.clone() }),
             None => self.pricing().map(|p| p.cost(&response.usage)),
-        }
+        }?;
+        let conservative = self.pricing();
+        response.rejected.iter().try_fold(answer, |acc, r| {
+            r.cost_usd.or_else(|| conservative.map(|p| p.cost(&r.usage))).map(|c| acc + c)
+        })
     }
 
     fn unpriced_models(&self) -> Vec<String> {

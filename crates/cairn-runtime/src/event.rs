@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::message::Message;
-use crate::model::ModelResponse;
+use crate::model::{ModelResponse, Usage};
 
 /// One immutable fact in a run's history.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -33,6 +33,11 @@ pub enum EventKind {
     ModelFailed {
         step: u32,
         error: String,
+        /// Tokens already paid for before the failure (e.g. rejected answers).
+        #[serde(default)]
+        usage: Usage,
+        #[serde(default)]
+        cost_usd: Option<f64>,
     },
     ToolDenied {
         call_id: String,

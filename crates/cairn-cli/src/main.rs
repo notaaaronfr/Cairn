@@ -99,7 +99,7 @@ fn summary(kind: &EventKind) -> String {
                 parts.join(", ")
             )
         }
-        EventKind::ModelFailed { step, error } => format!("step={step} {}", truncate(error, 80)),
+        EventKind::ModelFailed { step, error, .. } => format!("step={step} {}", truncate(error, 80)),
         EventKind::ToolDenied { tool, reason, .. } => format!("{tool}: {reason}"),
         EventKind::ApprovalRequested { tool, input, reason, .. } => {
             format!("{tool} {} ({reason})", truncate(&input.to_string(), 60))

@@ -170,7 +170,7 @@ impl OpenAiCompatModel {
                 cache_read_tokens: cached,
                 cache_write_tokens: 0,
             },
-            served_by: None,
+            ..Default::default()
         })
     }
 }
@@ -328,7 +328,7 @@ impl StreamAcc {
             content,
             stop_reason,
             usage: self.usage,
-            served_by: None,
+            ..Default::default()
         })])
     }
 }

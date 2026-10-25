@@ -228,7 +228,10 @@ impl Agent {
             }
             Err(e) => {
                 let error = e.to_string();
-                self.emit(state, EventKind::ModelFailed { step, error: error.clone() }).await?;
+                let (usage, spent) = e.spent();
+                // Unpriced spend can only happen without a USD budget.
+                let cost_usd = spent.or_else(|| self.model.pricing().map(|p| p.cost(&usage)));
+                self.emit(state, EventKind::ModelFailed { step, error: error.clone(), usage, cost_usd }).await?;
                 self.emit(state, EventKind::RunFailed { error }).await?;
             }
         }
