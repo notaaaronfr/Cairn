@@ -9,6 +9,7 @@
 
 pub mod agent;
 pub mod budget;
+pub mod eval;
 pub mod event;
 pub mod journal;
 pub mod message;

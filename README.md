@@ -98,6 +98,27 @@ from MCP annotations (`readOnlyHint` → Read, `destructiveHint: false` → Writ
 which requires approval by default). Credentials stay in the client; every call carries Cairn's
 idempotency key in `_meta`.
 
+### Evals by replay
+
+```rust
+use cairn::eval::{Completed, EvalCase, Evaluator, FieldsMatch, Judge};
+
+let cases = EvalCase::load(journal.as_ref(), &recent_run_ids).await?;          // recorded production runs
+let k2_worker = production_agent.to_builder().model(k2).build()?;               // candidate configuration
+let report = Evaluator::new(k2_worker)
+    .scorer(Completed)
+    .scorer(FieldsMatch::new(&["risks"]))
+    .scorer(Judge::new(haiku, "Same outcome; risks stated honestly."))
+    .run(&cases)
+    .await;
+println!("{}", report.to_markdown());                                           // scores + cost, baseline vs candidate
+assert!(report.pass_rate(0.8) >= 0.9);                                          // gate CI
+```
+
+Replays never repeat side effects: matching tool calls get the recorded result, unmatched read-only
+calls may run live (`LiveTools::ReadOnly`, default) and writes never run. Replays use their own
+in-memory journal.
+
 ## Principles
 
 1. **The journal is the source of truth.** Resume, replay, audit and evals all derive from it.
@@ -139,7 +160,7 @@ idempotency key in `_meta`.
 - [ ] Context engine: compaction policies, token budgets per section
 - [x] MCP client — stdio + Streamable HTTP, annotations → effects, cancellation, idempotency keys
 - [ ] Per-agent credential brokering for MCP (OAuth)
-- [ ] Evals: replay recorded runs against new models/prompts, score, gate CI
+- [x] Evals by replay — recorded runs on a candidate model, side-effect-safe, scorers incl. LLM judge, cost comparison
 - [ ] Sub-agents as tools; OpenTelemetry GenAI spans
 - [ ] Python (PyO3) and TypeScript (napi-rs) bindings over the same core
 

@@ -657,3 +657,131 @@ mod finish_schema {
         assert!(err.to_string().contains("invalid finish schema"), "{err}");
     }
 }
+
+mod evals {
+    use super::*;
+    use cairn_runtime::eval::{Completed, EvalCase, Evaluator, FieldsMatch, Judge, LiveTools};
+
+    const HANDOFF: &str = r#"{"summary":"Fixed","work":"Patched T-1","risks":["none"],"confidence":0.9}"#;
+
+    struct Counters {
+        reads: Arc<AtomicU32>,
+        writes: Arc<AtomicU32>,
+    }
+
+    fn tools(c: &Counters) -> (impl Tool + 'static, impl Tool + 'static) {
+        let reads = c.reads.clone();
+        let get_task = tool("get_task", "Get a task", Effect::Read, move |i: Id, _ctx| {
+            let reads = reads.clone();
+            async move {
+                reads.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"id": i.id, "title": format!("live task {}", i.id)}))
+            }
+        });
+        let writes = c.writes.clone();
+        let submit = tool("submit_work", "Submit", Effect::Irreversible, move |i: Id, _ctx| {
+            let writes = writes.clone();
+            async move {
+                writes.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"submitted": i.id}))
+            }
+        });
+        (get_task, submit)
+    }
+
+    /// Production agent ("Haiku") whose run gets recorded.
+    async fn production(c: &Counters, journal: Arc<dyn Journal>) -> (Agent, String) {
+        let (get_task, submit) = tools(c);
+        let agent = Agent::builder("worker")
+            .model(ScriptedModel::new(vec![
+                tool_call_response(&[("c1", "get_task", json!({"id": 1}))]),
+                tool_call_response(&[("c2", "submit_work", json!({"id": 1}))]),
+                text_response(HANDOFF),
+            ]))
+            .tool(get_task)
+            .tool(submit)
+            .policy(AllowAll)
+            .shared_journal(journal)
+            .finish_schema(json!({"type": "object", "required": ["summary", "work", "risks", "confidence"]}))
+            .build()
+            .unwrap();
+        let out = agent.run("Work on task 1").await.unwrap();
+        assert!(out.structured.is_some());
+        (agent, out.run_id)
+    }
+
+    #[tokio::test]
+    async fn replay_on_candidate_never_repeats_side_effects() {
+        let c = Counters { reads: Arc::default(), writes: Arc::default() };
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let (prod, run_id) = production(&c, journal.clone()).await;
+        assert_eq!((c.reads.load(Ordering::SeqCst), c.writes.load(Ordering::SeqCst)), (1, 1));
+        let events_before = journal.load(&run_id).await.unwrap().len();
+
+        // Candidate ("K2"): same reads/writes as recorded, plus an extra
+        // unrecorded read and an unrecorded write.
+        let k2 = Arc::new(ScriptedModel::new(vec![
+            tool_call_response(&[("k1", "get_task", json!({"id": 1})), ("k2", "get_task", json!({"id": 2}))]),
+            tool_call_response(&[("k3", "submit_work", json!({"id": 1})), ("k4", "submit_work", json!({"id": 2}))]),
+            text_response(HANDOFF),
+        ]));
+        let judge = ScriptedModel::new(vec![text_response(r#"{"score": 0.8, "reason": "same outcome"}"#)]);
+        let candidate = prod.to_builder().model(k2.clone()).build().unwrap();
+        let cases = EvalCase::load(journal.as_ref(), std::slice::from_ref(&run_id)).await.unwrap();
+        let report = Evaluator::new(candidate)
+            .scorer(Completed)
+            .scorer(FieldsMatch::new(&["summary", "risks"]))
+            .scorer(Judge::new(judge, "Same task outcome and honest risks."))
+            .run(&cases)
+            .await;
+
+        // No real write happened; the unrecorded read ran live.
+        assert_eq!(c.writes.load(Ordering::SeqCst), 1, "replay must never execute a write");
+        assert_eq!(c.reads.load(Ordering::SeqCst), 2, "only the unrecorded read ran live");
+
+        let requests = k2.requests();
+        let reads = &requests[1].messages.last().unwrap().content;
+        assert!(matches!(&reads[0], Content::ToolResult { content, .. } if content["title"] == "live task 1"), "recorded result served");
+        assert!(matches!(&reads[1], Content::ToolResult { content, .. } if content["title"] == "live task 2"));
+        let writes = &requests[2].messages.last().unwrap().content;
+        assert!(matches!(&writes[0], Content::ToolResult { content, is_error: false, .. } if content["submitted"] == 1));
+        assert!(matches!(&writes[1], Content::ToolResult { content, is_error: true, .. }
+            if content["error"].as_str().unwrap().contains("not executed")));
+
+        // Scores and report.
+        assert_eq!(report.mean("completed"), 1.0);
+        assert_eq!(report.mean("fields_match(summary,risks)"), 1.0);
+        assert_eq!(report.mean("judge"), 0.8);
+        assert_eq!(report.pass_rate(0.8), 1.0);
+        assert_eq!(report.pass_rate(0.9), 0.0);
+        assert!(report.baseline_cost() > 0.0 && report.candidate_cost() > 0.0);
+        let md = report.to_markdown();
+        assert!(md.contains("| judge |") && md.contains("**Mean:**"), "{md}");
+
+        // Production history untouched.
+        assert_eq!(journal.load(&run_id).await.unwrap().len(), events_before);
+    }
+
+    #[tokio::test]
+    async fn never_mode_blocks_unrecorded_reads_too() {
+        let c = Counters { reads: Arc::default(), writes: Arc::default() };
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let (prod, run_id) = production(&c, journal.clone()).await;
+        let k2 = Arc::new(ScriptedModel::new(vec![tool_call_response(&[("k1", "get_task", json!({"id": 7}))]), text_response(HANDOFF)]));
+        let cases = EvalCase::load(journal.as_ref(), &[run_id]).await.unwrap();
+        Evaluator::new(prod.to_builder().model(k2.clone()).build().unwrap()).live_tools(LiveTools::Never).run(&cases).await;
+        assert_eq!(c.reads.load(Ordering::SeqCst), 1, "no live read during replay");
+    }
+
+    #[tokio::test]
+    async fn failing_candidate_scores_zero() {
+        let c = Counters { reads: Arc::default(), writes: Arc::default() };
+        let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
+        let (prod, run_id) = production(&c, journal.clone()).await;
+        let k2 = ScriptedModel::new(vec![text_response("I did it"), text_response("still no json")]);
+        let cases = EvalCase::load(journal.as_ref(), &[run_id]).await.unwrap();
+        let report = Evaluator::new(prod.to_builder().model(k2).build().unwrap()).scorer(Completed).run(&cases).await;
+        assert_eq!(report.mean("completed"), 0.0);
+        assert_eq!(report.pass_rate(0.5), 0.0);
+    }
+}

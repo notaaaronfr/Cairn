@@ -136,6 +136,27 @@ impl Agent {
         &self.name
     }
 
+    /// A builder pre-filled with this agent's configuration, for deriving
+    /// variants (another model, journal or tool set).
+    pub fn to_builder(&self) -> AgentBuilder {
+        AgentBuilder {
+            name: self.name.clone(),
+            model: Some(self.model.clone()),
+            system: self.system.clone(),
+            tools: self.tools.clone(),
+            budget: self.budget.clone(),
+            policy: self.policy.clone(),
+            journal: self.journal.clone(),
+            max_tokens: self.max_tokens,
+            temperature: self.temperature,
+            provider_options: self.provider_options.clone(),
+            on_delta: self.on_delta.clone(),
+            tool_timeout: self.tool_timeout,
+            finish_schema: self.finish.as_ref().map(|f| f.schema.clone()),
+            finish_retries: self.finish.as_ref().map_or(1, |f| f.retries),
+        }
+    }
+
     pub fn journal(&self) -> &Arc<dyn Journal> {
         &self.journal
     }
@@ -446,6 +467,22 @@ pub struct AgentBuilder {
 impl AgentBuilder {
     pub fn model(mut self, model: impl Model + 'static) -> Self {
         self.model = Some(Arc::new(model));
+        self
+    }
+
+    /// Replace the tool set.
+    pub fn replace_tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
+        self.tools = tools;
+        self
+    }
+
+    pub(crate) fn tool_list(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
+    /// Stop streaming deltas (e.g. for background replays).
+    pub fn without_on_delta(mut self) -> Self {
+        self.on_delta = None;
         self
     }
 
