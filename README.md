@@ -62,6 +62,10 @@ With several workers, each run is driven by one worker at a time: `resume` takes
 in the background, 60 s by default via `.lease_ttl(..)`), other workers get `AgentError::Leased`, and a
 crashed worker's runs can be taken over once its lease expires. Postgres leases use the database clock.
 
+A worker serving an outside queue can name its runs after the job: `agent.run_with_id("task-42-1", input)`
+refuses an id already in the journal, so after a crash it can `resume` by the same id without having stored
+a generated one first.
+
 Run the Postgres tests with `CAIRN_TEST_DATABASE_URL=postgres://user@host/db cargo test -p cairn-journal-postgres`
 (they are skipped when the variable is unset).
 

@@ -22,6 +22,8 @@ pub enum AgentError {
     Journal(#[from] JournalError),
     #[error("no run with id `{0}`")]
     UnknownRun(String),
+    #[error("a run with id `{0}` already exists")]
+    RunExists(String),
     #[error("call `{call_id}` in run `{run_id}` is not awaiting approval")]
     NotAwaitingApproval { run_id: String, call_id: String },
     #[error("invalid agent configuration: {0}")]
@@ -202,14 +204,48 @@ impl Agent {
     }
 
     pub async fn run_message(&self, input: Message) -> Result<RunOutcome, AgentError> {
-        let run_id = uuid::Uuid::now_v7().to_string();
+        self.start(uuid::Uuid::now_v7().to_string(), input).await
+    }
+
+    /// Start a new run under an id the caller chooses, and drive it.
+    ///
+    /// For a worker serving an outside job queue: derive the id from the job
+    /// (e.g. `"task-42:1"`), and after a crash the run can be found and
+    /// [`resume`](Self::resume)d without having stored a generated id
+    /// anywhere first. Fails with [`AgentError::RunExists`] if the id is
+    /// already in the journal.
+    pub async fn run_with_id(&self, run_id: &str, input: impl Into<String>) -> Result<RunOutcome, AgentError> {
+        // The id names a file in the JSONL journal, so it must be a plain name:
+        // nothing that could climb out of the directory or trip up a filesystem.
+        let plain = !run_id.is_empty()
+            && run_id.len() <= 128
+            && !run_id.starts_with('.')
+            && run_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+        if !plain {
+            return Err(AgentError::Config(format!(
+                "run id `{run_id}` must be 1–128 characters of A–Z, a–z, 0–9, '-', '_' or '.', not starting with '.'"
+            )));
+        }
+        if !self.journal.load(run_id).await?.is_empty() {
+            return Err(AgentError::RunExists(run_id.to_owned()));
+        }
+        self.start(run_id.to_owned(), Message::user(input)).await
+    }
+
+    async fn start(&self, run_id: String, input: Message) -> Result<RunOutcome, AgentError> {
         let first = Event {
             run_id: run_id.clone(),
             seq: 0,
             at: Utc::now(),
             kind: EventKind::RunStarted { agent: self.name.clone(), input },
         };
-        self.journal.append(&first).await?;
+        // Two workers racing to start the same chosen id: the journal's
+        // sequence check lets exactly one in.
+        match self.journal.append(&first).await {
+            Ok(()) => {}
+            Err(JournalError::Conflict { .. }) => return Err(AgentError::RunExists(run_id)),
+            Err(e) => return Err(e.into()),
+        }
         let state = RunState::from_events(std::slice::from_ref(&first)).expect("one event");
         tracing::info!(run_id = %run_id, agent = %self.name, "run started");
         self.drive_leased(state).await

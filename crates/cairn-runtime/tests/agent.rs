@@ -872,3 +872,30 @@ mod leases {
         assert_eq!(refunds.load(Ordering::SeqCst), 1);
     }
 }
+
+#[tokio::test]
+async fn run_with_id_starts_under_the_given_id_once() {
+    let model = Arc::new(ScriptedModel::new(vec![text_response("done")]));
+    let agent = Agent::builder("t").model(model).build().unwrap();
+
+    let out = agent.run_with_id("task-42-1", "go").await.unwrap();
+    assert_eq!(out.run_id, "task-42-1");
+    assert_eq!(out.output(), Some("done"));
+    assert!(agent.state("task-42-1").await.is_ok(), "findable by the id the caller chose");
+
+    let again = agent.run_with_id("task-42-1", "go").await;
+    assert!(matches!(again, Err(AgentError::RunExists(id)) if id == "task-42-1"));
+}
+
+#[tokio::test]
+async fn run_with_id_refuses_ids_that_are_not_plain_names() {
+    let model = Arc::new(ScriptedModel::new(vec![]));
+    let dir = std::env::temp_dir().join(format!("cairn-runid-{}", std::process::id()));
+    let agent = Agent::builder("t").model(model).journal(JsonlJournal::new(&dir).unwrap()).build().unwrap();
+
+    for bad in ["", "../escape", "a/b", ".hidden", "a:b", "white space", &"x".repeat(129)] {
+        assert!(matches!(agent.run_with_id(bad, "go").await, Err(AgentError::Config(_))), "refused: {bad:?}");
+    }
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing was written");
+    std::fs::remove_dir_all(&dir).ok();
+}
