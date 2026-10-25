@@ -67,4 +67,8 @@ impl<M: Model> Model for Priced<M> {
     fn pricing(&self) -> Option<Pricing> {
         Some(self.pricing)
     }
+
+    fn unpriced_models(&self) -> Vec<String> {
+        Vec::new()
+    }
 }

@@ -305,8 +305,10 @@ async fn usd_budget_actually_stops_the_run() {
         .unwrap();
     let out = agent.run("go").await.unwrap();
     assert!(matches!(out.status, Status::BudgetExceeded { .. }), "{:?}", out.status);
-    assert_eq!(out.steps, 3);
-    assert!(out.cost_usd > 0.0003);
+    // Two steps cost $0.00024; a third could not fit in what is left, so the
+    // run stops before calling rather than overshooting.
+    assert_eq!(out.steps, 2);
+    assert!(out.cost_usd <= 0.0003, "{}", out.cost_usd);
 }
 
 #[tokio::test]
@@ -498,5 +500,69 @@ mod usable_fallback {
         let out = agent.run("go").await.unwrap();
         assert_eq!(out.output(), Some("good"));
         assert_eq!(*seen.lock().unwrap(), "good");
+    }
+}
+
+mod budget_cap {
+    use super::*;
+
+    fn looping(n: usize) -> Vec<ModelResponse> {
+        (0..n).map(|i| tool_call_response(&[(&format!("c{i}"), "lookup", json!({"id": i}))])).collect()
+    }
+
+    fn agent(model: Arc<ScriptedModel>, budget: Budget) -> Agent {
+        Agent::builder("t")
+            .model(model)
+            .tool(counting_tool("lookup", Effect::Read, Arc::new(AtomicU32::new(0))))
+            .max_tokens(4096)
+            .budget(budget)
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn token_budget_shrinks_each_steps_answer_limit() {
+        let model = Arc::new(ScriptedModel::new(looping(10)));
+        let out = agent(model.clone(), Budget::default().max_tokens(1500)).run("go").await.unwrap();
+        assert!(matches!(out.status, Status::BudgetExceeded { .. }), "{:?}", out.status);
+
+        let caps: Vec<u32> = model.requests().iter().map(|r| r.max_tokens).collect();
+        assert!(caps[0] < 1500, "first cap {} must fit the 1500-token budget", caps[0]);
+        assert!(caps.windows(2).all(|w| w[1] < w[0]), "caps must shrink as the budget is used: {caps:?}");
+        // Each call's used tokens + its cap never exceeded what was left.
+        assert!(out.usage.total() <= 1500, "{}", out.usage.total());
+    }
+
+    #[tokio::test]
+    async fn usd_budget_shrinks_answer_limit() {
+        // $1/Mtok: $0.0006 buys 600 tokens in total.
+        let model = Arc::new(ScriptedModel::new(looping(10)));
+        let out = agent(model.clone(), Budget::default().max_usd(0.0006)).run("go").await.unwrap();
+        assert!(matches!(out.status, Status::BudgetExceeded { .. }));
+        let first = model.requests()[0].max_tokens;
+        assert!(first < 600, "{first}");
+        assert!(out.cost_usd <= 0.0006 + 1e-12, "{}", out.cost_usd);
+    }
+
+    #[tokio::test]
+    async fn stops_before_calling_when_budget_cannot_buy_minimum() {
+        let model = Arc::new(ScriptedModel::new(looping(1)));
+        let out = agent(model.clone(), Budget::default().max_tokens(5_000).min_output_tokens(10_000)).run("go").await.unwrap();
+        let Status::BudgetExceeded { reason } = &out.status else { panic!("{:?}", out.status) };
+        assert!(reason.contains("minimum 10000"), "{reason}");
+        assert!(model.requests().is_empty(), "no model call may be made");
+    }
+
+    #[tokio::test]
+    async fn fallback_cap_accounts_for_every_paid_attempt() {
+        let single = Arc::new(ScriptedModel::new(vec![text_response("a")]));
+        agent(single.clone(), Budget::default().max_usd(0.001)).run("go").await.unwrap();
+
+        let a = Arc::new(ScriptedModel::new(vec![text_response("a")]));
+        let chain = FallbackModel::new(vec![a.clone(), Arc::new(ScriptedModel::new(vec![]))]);
+        Agent::builder("t").model(chain).max_tokens(4096).budget(Budget::default().max_usd(0.001)).build().unwrap().run("go").await.unwrap();
+
+        let (one, two) = (single.requests()[0].max_tokens, a.requests()[0].max_tokens);
+        assert!(two < one, "a two-model chain must leave room for both attempts: {two} vs {one}");
     }
 }

@@ -200,7 +200,7 @@ impl Agent {
     }
 
     async fn model_turn(&self, state: &mut RunState) -> Result<(), AgentError> {
-        let request = ModelRequest {
+        let mut request = ModelRequest {
             system: self.system.clone(),
             messages: state.messages.clone(),
             tools: self.tools.iter().map(|t| t.spec().clone()).collect(),
@@ -208,6 +208,15 @@ impl Agent {
             temperature: self.temperature,
             provider_options: self.provider_options.clone(),
         };
+        // Shrink this step's answer limit to what the remaining budget can
+        // pay for, so one call cannot overshoot it.
+        let est_input = estimate_input_tokens(&request);
+        match self.budget.output_cap(self.max_tokens, state.usage.total(), state.cost_usd, est_input, |i, o| {
+            self.model.max_call_cost(i, o)
+        }) {
+            Ok(cap) => request.max_tokens = cap,
+            Err(reason) => return self.emit(state, EventKind::BudgetExceeded { reason }).await,
+        }
         let step = state.steps + 1;
         let started = Instant::now();
 
@@ -335,6 +344,15 @@ impl Agent {
         };
         self.emit(state, kind).await
     }
+}
+
+/// Conservative input-size estimate: about 3 characters per token over the
+/// serialized system prompt, messages and tool definitions.
+fn estimate_input_tokens(request: &ModelRequest) -> u64 {
+    let chars = request.system.as_deref().map_or(0, str::len)
+        + serde_json::to_string(&request.messages).map_or(0, |s| s.len())
+        + serde_json::to_string(&request.tools).map_or(0, |s| s.len());
+    (chars as u64).div_ceil(3)
 }
 
 pub struct AgentBuilder {

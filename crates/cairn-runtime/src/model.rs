@@ -162,6 +162,15 @@ pub trait Model: Send + Sync {
         self.pricing().map(|p| p.cost(&response.usage))
     }
 
+    /// Upper bound in USD for one call with this many input and output
+    /// tokens, counting every attempt a composite model might make. Input is
+    /// priced at the higher of the input and cache-write rates.
+    fn max_call_cost(&self, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+        self.pricing().map(|p| {
+            (input_tokens as f64 * p.input.max(p.cache_write) + output_tokens as f64 * p.output) / 1_000_000.0
+        })
+    }
+
     /// Ids of models (including any inside a composite) that have no
     /// pricing. A USD budget cannot be enforced while this is non-empty.
     fn unpriced_models(&self) -> Vec<String> {
@@ -408,6 +417,11 @@ impl Model for FallbackModel {
     fn unpriced_models(&self) -> Vec<String> {
         self.models.iter().flat_map(|m| m.unpriced_models()).collect()
     }
+
+    /// Every model may be tried (and paid for) in one call.
+    fn max_call_cost(&self, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+        self.models.iter().map(|m| m.max_call_cost(input_tokens, output_tokens)).sum()
+    }
 }
 
 #[async_trait]
@@ -434,5 +448,9 @@ impl<M: Model + ?Sized> Model for Arc<M> {
 
     fn unpriced_models(&self) -> Vec<String> {
         (**self).unpriced_models()
+    }
+
+    fn max_call_cost(&self, input_tokens: u64, output_tokens: u64) -> Option<f64> {
+        (**self).max_call_cost(input_tokens, output_tokens)
     }
 }
