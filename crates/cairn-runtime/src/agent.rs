@@ -390,6 +390,17 @@ impl AgentBuilder {
 
     pub fn build(self) -> Result<Agent, AgentError> {
         let model = self.model.ok_or_else(|| AgentError::Config("a model is required".into()))?;
+        if self.budget.max_usd.is_some() {
+            let unpriced = model.unpriced_models();
+            if !unpriced.is_empty() {
+                return Err(AgentError::Config(format!(
+                    "max_usd is set but these models have no pricing, so spend could not be counted: {}. \
+                     Set pricing (e.g. Priced::new(model, Pricing::new(input, output))); \
+                     use Pricing::new(0.0, 0.0) for a model that is genuinely free",
+                    unpriced.join(", ")
+                )));
+            }
+        }
         let mut seen = std::collections::HashSet::new();
         for t in &self.tools {
             if !seen.insert(t.spec().name.clone()) {

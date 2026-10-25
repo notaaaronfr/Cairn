@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::message::{Content, Message};
+use crate::pricing::Pricing;
 use crate::tool::ToolSpec;
 
 #[derive(Debug, Clone, Default)]
@@ -23,9 +24,10 @@ pub struct ModelRequest {
     pub provider_options: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StopReason {
+    #[default]
     EndTurn,
     ToolUse,
     MaxTokens,
@@ -55,13 +57,17 @@ impl Usage {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ModelResponse {
-    /// Concrete model that produced the response (after any fallback).
+    /// Model name as reported by the provider.
     pub model: String,
     pub content: Vec<Content>,
     pub stop_reason: StopReason,
     pub usage: Usage,
+    /// [`Model::id`] of the model that served this response, when a
+    /// composite model (e.g. [`FallbackModel`]) chose among several.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_by: Option<String>,
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -102,9 +108,20 @@ pub trait Model: Send + Sync {
         Ok(Box::pin(stream::iter(synthesize_stream(response).into_iter().map(Ok))))
     }
 
-    /// Cost of a response in USD, if pricing is configured.
-    fn cost_usd(&self, _response: &ModelResponse) -> Option<f64> {
+    /// Prices for this model, if configured. Required for USD budgets.
+    fn pricing(&self) -> Option<Pricing> {
         None
+    }
+
+    /// Cost of a response in USD, if pricing is configured.
+    fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {
+        self.pricing().map(|p| p.cost(&response.usage))
+    }
+
+    /// Ids of models (including any inside a composite) that have no
+    /// pricing. A USD budget cannot be enforced while this is non-empty.
+    fn unpriced_models(&self) -> Vec<String> {
+        if self.pricing().is_none() { vec![self.id()] } else { Vec::new() }
     }
 }
 
@@ -172,7 +189,10 @@ impl Model for FallbackModel {
         let mut last_err = None;
         for model in &self.models {
             match model.complete(request).await {
-                Ok(resp) => return Ok(resp),
+                Ok(mut resp) => {
+                    resp.served_by.get_or_insert_with(|| model.id());
+                    return Ok(resp);
+                }
                 Err(e) if e.retryable() => {
                     tracing::warn!(model = %model.id(), error = %e, "model failed, falling back");
                     last_err = Some(e);
@@ -189,7 +209,16 @@ impl Model for FallbackModel {
         let mut last_err = None;
         for model in &self.models {
             match model.stream(request).await {
-                Ok(s) => return Ok(s),
+                Ok(s) => {
+                    let id = model.id();
+                    return Ok(Box::pin(futures::StreamExt::map(s, move |ev| match ev {
+                        Ok(StreamEvent::Completed(mut resp)) => {
+                            resp.served_by.get_or_insert_with(|| id.clone());
+                            Ok(StreamEvent::Completed(resp))
+                        }
+                        other => other,
+                    })));
+                }
                 Err(e) if e.retryable() => {
                     tracing::warn!(model = %model.id(), error = %e, "model stream failed, falling back");
                     last_err = Some(e);
@@ -200,8 +229,24 @@ impl Model for FallbackModel {
         Err(last_err.expect("at least one model"))
     }
 
+    /// Conservative (field-wise maximum) pricing across all models, or
+    /// `None` if any model is unpriced.
+    fn pricing(&self) -> Option<Pricing> {
+        self.models.iter().map(|m| m.pricing()).try_fold(Pricing::default(), |acc, p| p.map(|p| acc.max(p)))
+    }
+
+    /// Prices the response with the model that actually served it; falls
+    /// back to the conservative maximum rather than ever under-counting.
     fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {
-        self.models.iter().find(|m| m.id().ends_with(&response.model)).and_then(|m| m.cost_usd(response))
+        let served = response.served_by.as_deref();
+        match self.models.iter().find(|m| Some(m.id().as_str()) == served) {
+            Some(m) => m.cost_usd(response),
+            None => self.pricing().map(|p| p.cost(&response.usage)),
+        }
+    }
+
+    fn unpriced_models(&self) -> Vec<String> {
+        self.models.iter().flat_map(|m| m.unpriced_models()).collect()
     }
 }
 
@@ -219,7 +264,15 @@ impl<M: Model + ?Sized> Model for Arc<M> {
         (**self).stream(request).await
     }
 
+    fn pricing(&self) -> Option<Pricing> {
+        (**self).pricing()
+    }
+
     fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {
         (**self).cost_usd(response)
+    }
+
+    fn unpriced_models(&self) -> Vec<String> {
+        (**self).unpriced_models()
     }
 }

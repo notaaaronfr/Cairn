@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 pub struct Budget {
     /// Maximum number of model calls.
     pub max_steps: Option<u32>,
-    /// Maximum spend in USD (requires the model to report pricing).
+    /// Maximum spend in USD. Every model the agent may call must have
+    /// pricing, otherwise [`crate::AgentBuilder::build`] refuses the agent.
     pub max_usd: Option<f64>,
     /// Maximum input + output tokens.
     pub max_tokens: Option<u64>,

@@ -170,6 +170,7 @@ impl OpenAiCompatModel {
                 cache_read_tokens: cached,
                 cache_write_tokens: 0,
             },
+            served_by: None,
         })
     }
 }
@@ -204,8 +205,8 @@ impl Model for OpenAiCompatModel {
         Ok(sse::translate(sse::events(resp), acc, StreamAcc::step, StreamAcc::end))
     }
 
-    fn cost_usd(&self, response: &ModelResponse) -> Option<f64> {
-        self.pricing.map(|p| p.cost(&response.usage))
+    fn pricing(&self) -> Option<Pricing> {
+        self.pricing
     }
 }
 
@@ -327,6 +328,7 @@ impl StreamAcc {
             content,
             stop_reason,
             usage: self.usage,
+            served_by: None,
         })])
     }
 }

@@ -241,3 +241,82 @@ async fn streams_deltas_and_journals_only_completed_steps() {
     let events = agent.journal().load(&out.run_id).await.unwrap();
     assert_eq!(events.iter().filter(|e| matches!(e.kind, EventKind::ModelCalled { .. })).count(), 2);
 }
+
+/// A model with no pricing configured.
+struct Unpriced(ScriptedModel);
+
+#[async_trait::async_trait]
+impl Model for Unpriced {
+    fn id(&self) -> String {
+        "unpriced:model".into()
+    }
+    async fn complete(&self, r: &ModelRequest) -> Result<ModelResponse, ModelError> {
+        self.0.complete(r).await
+    }
+}
+
+/// Fails with a retryable error so fallback moves on.
+struct Down;
+
+#[async_trait::async_trait]
+impl Model for Down {
+    fn id(&self) -> String {
+        "down:model".into()
+    }
+    async fn complete(&self, _: &ModelRequest) -> Result<ModelResponse, ModelError> {
+        Err(ModelError::Api { status: 503, body: "overloaded".into() })
+    }
+    fn pricing(&self) -> Option<Pricing> {
+        Some(Pricing::new(1000.0, 1000.0))
+    }
+}
+
+#[test]
+fn usd_budget_refuses_unpriced_models() {
+    let err = Agent::builder("t")
+        .model(Unpriced(ScriptedModel::new(vec![])))
+        .budget(Budget::default().max_usd(1.0))
+        .build()
+        .err()
+        .expect("must refuse");
+    assert!(err.to_string().contains("unpriced:model"), "{err}");
+
+    // Also when the unpriced model hides inside a fallback chain.
+    let chain = FallbackModel::new(vec![Arc::new(ScriptedModel::new(vec![])), Arc::new(Unpriced(ScriptedModel::new(vec![])))]);
+    let err = Agent::builder("t").model(chain).budget(Budget::default().max_usd(1.0)).build().err().expect("must refuse");
+    assert!(err.to_string().contains("unpriced:model"), "{err}");
+
+    // Without a USD budget, unpriced models are fine.
+    assert!(Agent::builder("t").model(Unpriced(ScriptedModel::new(vec![]))).build().is_ok());
+    // A genuinely free model opts in explicitly.
+    let free = Priced::new(Unpriced(ScriptedModel::new(vec![])), Pricing::new(0.0, 0.0));
+    assert!(Agent::builder("t").model(free).budget(Budget::default().max_usd(1.0)).build().is_ok());
+}
+
+#[tokio::test]
+async fn usd_budget_actually_stops_the_run() {
+    // ScriptedModel: $1/Mtok, 120 tokens per call => $0.00012 per step.
+    let looping: Vec<_> = (0..10).map(|i| tool_call_response(&[(&format!("c{i}"), "lookup", json!({"id": i}))])).collect();
+    let agent = Agent::builder("t")
+        .model(ScriptedModel::new(looping))
+        .tool(counting_tool("lookup", Effect::Read, Arc::new(AtomicU32::new(0))))
+        .budget(Budget::default().max_usd(0.0003))
+        .build()
+        .unwrap();
+    let out = agent.run("go").await.unwrap();
+    assert!(matches!(out.status, Status::BudgetExceeded { .. }), "{:?}", out.status);
+    assert_eq!(out.steps, 3);
+    assert!(out.cost_usd > 0.0003);
+}
+
+#[tokio::test]
+async fn fallback_prices_the_model_that_served() {
+    let mut reply = text_response("hi");
+    reply.model = "provider-name-2026-10-01".into(); // provider-reported name differs from id
+    let cheap = Arc::new(Priced::new(ScriptedModel::new(vec![reply]), Pricing::new(10.0, 10.0)));
+    let chain = FallbackModel::new(vec![Arc::new(Down), cheap]);
+    let agent = Agent::builder("t").model(chain).budget(Budget::default().max_usd(1.0)).build().unwrap();
+    let out = agent.run("go").await.unwrap();
+    // 120 tokens at $10/Mtok on the serving model, not $1000/Mtok (the max).
+    assert!((out.cost_usd - 0.0012).abs() < 1e-12, "{}", out.cost_usd);
+}

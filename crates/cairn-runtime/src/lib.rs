@@ -14,6 +14,7 @@ pub mod journal;
 pub mod message;
 pub mod model;
 pub mod policy;
+pub mod pricing;
 pub mod state;
 pub mod testing;
 pub mod tool;
@@ -28,5 +29,6 @@ pub use model::{
     synthesize_stream,
 };
 pub use policy::{AllowAll, Decision, EffectPolicy, Policy};
+pub use pricing::{Priced, Pricing};
 pub use state::{PendingCall, RunState, Status};
 pub use tool::{Effect, Tool, ToolCtx, ToolError, ToolSpec, tool};
