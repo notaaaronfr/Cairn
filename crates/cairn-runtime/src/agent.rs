@@ -459,6 +459,12 @@ impl AgentBuilder {
         self
     }
 
+    /// Add several tools at once (e.g. all tools from an MCP server).
+    pub fn tools<T: Tool + 'static>(mut self, tools: impl IntoIterator<Item = T>) -> Self {
+        self.tools.extend(tools.into_iter().map(|t| Arc::new(t) as Arc<dyn Tool>));
+        self
+    }
+
     pub fn budget(mut self, budget: Budget) -> Self {
         self.budget = budget;
         self

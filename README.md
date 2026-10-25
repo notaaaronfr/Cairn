@@ -80,6 +80,24 @@ let agent = Agent::builder("worker")
 
 (Example prices are placeholders — use your providers' current rates.)
 
+### MCP tools
+
+```rust
+// features = ["mcp"]
+use cairn::mcp::{McpClient, ToolOptions};
+
+let whatstask = McpClient::connect_http(&url, [("authorization", format!("Bearer {token}"))]).await?;
+let tools = whatstask
+    .tools(ToolOptions::default().effect("submit_work", Effect::Write))   // list_my_tasks, get_task, …
+    .await?;
+let agent = Agent::builder("worker").model(model).tools(tools).build()?;
+```
+
+Stdio servers: `McpClient::connect_stdio("npx", &["-y", "some-mcp-server"], env)`. Tool effects come
+from MCP annotations (`readOnlyHint` → Read, `destructiveHint: false` → Write, otherwise Irreversible,
+which requires approval by default). Credentials stay in the client; every call carries Cairn's
+idempotency key in `_meta`.
+
 ## Principles
 
 1. **The journal is the source of truth.** Resume, replay, audit and evals all derive from it.
@@ -101,6 +119,7 @@ let agent = Agent::builder("worker")
 | `cairn-ai` | Facade crate users depend on (`use cairn::prelude::*`) |
 | `cairn-gateway` | Drop-in OpenAI/Anthropic-compatible gateway: budgets, allowlists, failover, audit |
 | `cairn-journal-postgres` | PostgreSQL journal: many processes/machines can drive, approve and resume the same runs |
+| `cairn-ai-mcp` | MCP client (stdio + Streamable HTTP): any MCP server's tools as Cairn tools |
 | `cairn-ai-cli` | `cairn show` / `cairn state` journal inspector |
 
 ## Roadmap
@@ -118,7 +137,8 @@ let agent = Agent::builder("worker")
 - [x] Per-tool timeouts (120s default)
 - [ ] Parallel execution of read-only tools; tool retries
 - [ ] Context engine: compaction policies, token budgets per section
-- [ ] MCP client (tools from any MCP server) with per-agent credential brokering
+- [x] MCP client — stdio + Streamable HTTP, annotations → effects, cancellation, idempotency keys
+- [ ] Per-agent credential brokering for MCP (OAuth)
 - [ ] Evals: replay recorded runs against new models/prompts, score, gate CI
 - [ ] Sub-agents as tools; OpenTelemetry GenAI spans
 - [ ] Python (PyO3) and TypeScript (napi-rs) bindings over the same core

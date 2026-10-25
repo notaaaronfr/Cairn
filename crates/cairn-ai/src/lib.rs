@@ -28,9 +28,15 @@ pub mod models {
 #[cfg(feature = "postgres")]
 pub use cairn_journal_postgres::PostgresJournal;
 
+/// Model Context Protocol client (enable the `mcp` feature).
+#[cfg(feature = "mcp")]
+pub mod mcp {
+    pub use cairn_mcp::*;
+}
+
 pub mod prelude {
     pub use cairn_runtime::{
-        Agent, AllowAll, Budget, Content, Decision, Effect, EffectPolicy, Event, EventKind, FallbackModel,
+        Agent, AllowAll, Budget, Content, Decision, Effect, EffectPolicy, Event, EventKind, FallbackModel, Priced, Pricing,
         InMemoryJournal, Journal, JsonlJournal, Message, Model, PendingCall, Policy, RunOutcome, RunState, Status,
         StreamEvent, Tool, ToolCtx, ToolError, ToolSpec, tool,
     };
