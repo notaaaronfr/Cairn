@@ -113,7 +113,8 @@ fn summary(kind: &EventKind) -> String {
             truncate(&output.to_string(), 60)
         ),
         EventKind::BudgetExceeded { reason } => reason.clone(),
-        EventKind::RunCompleted { output } => format!("{:?}", truncate(output, 70)),
+        EventKind::RunCompleted { output, .. } => format!("{:?}", truncate(output, 70)),
+        EventKind::FinishRejected { step, reason } => format!("step={step} {}", truncate(reason, 80)),
         EventKind::RunFailed { error } => truncate(error, 80),
     }
 }

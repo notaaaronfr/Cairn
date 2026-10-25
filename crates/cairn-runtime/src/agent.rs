@@ -37,6 +37,8 @@ pub struct RunOutcome {
     pub usage: Usage,
     pub cost_usd: f64,
     pub awaiting_approval: Vec<PendingCall>,
+    /// The validated final answer, when the agent has a finish schema.
+    pub structured: Option<Value>,
 }
 
 impl RunOutcome {
@@ -55,7 +57,13 @@ impl RunOutcome {
             usage: state.usage,
             cost_usd: state.cost_usd,
             awaiting_approval: state.awaiting_approval(),
+            structured: state.structured_output.clone(),
         }
+    }
+
+    /// Deserialize the structured final answer into `T`.
+    pub fn output_as<T: serde::de::DeserializeOwned>(&self) -> Option<Result<T, serde_json::Error>> {
+        self.structured.clone().map(serde_json::from_value)
     }
 }
 
@@ -72,6 +80,31 @@ pub struct Agent {
     provider_options: BTreeMap<String, Value>,
     on_delta: Option<DeltaFn>,
     tool_timeout: Option<Duration>,
+    finish: Option<FinishSchema>,
+}
+
+/// A required shape for the run's final answer.
+struct FinishSchema {
+    schema: Value,
+    validator: jsonschema::Validator,
+    retries: u32,
+}
+
+impl FinishSchema {
+    /// The validated JSON, or why the answer does not satisfy the schema.
+    fn check(&self, text: &str) -> Result<Value, String> {
+        let value = crate::output::extract_json(text).ok_or_else(|| "the answer is not valid JSON".to_owned())?;
+        let errors: Vec<String> = self
+            .validator
+            .iter_errors(&value)
+            .take(5)
+            .map(|e| {
+                let path = e.instance_path().to_string();
+                if path.is_empty() { e.to_string() } else { format!("{path}: {e}") }
+            })
+            .collect();
+        if errors.is_empty() { Ok(value) } else { Err(errors.join("; ")) }
+    }
 }
 
 /// Default limit for a single tool call.
@@ -94,6 +127,8 @@ impl Agent {
             provider_options: BTreeMap::new(),
             on_delta: None,
             tool_timeout: Some(DEFAULT_TOOL_TIMEOUT),
+            finish_schema: None,
+            finish_retries: 1,
         }
     }
 
@@ -201,7 +236,7 @@ impl Agent {
 
     async fn model_turn(&self, state: &mut RunState) -> Result<(), AgentError> {
         let mut request = ModelRequest {
-            system: self.system.clone(),
+            system: self.system_prompt(),
             messages: state.messages.clone(),
             tools: self.tools.iter().map(|t| t.spec().clone()).collect(),
             max_tokens: self.max_tokens,
@@ -232,7 +267,7 @@ impl Agent {
                 let duration_ms = started.elapsed().as_millis() as u64;
                 self.emit(state, EventKind::ModelCalled { step, response, cost_usd, duration_ms }).await?;
                 if !wants_tools {
-                    self.emit(state, EventKind::RunCompleted { output: text }).await?;
+                    self.finish(state, step, text).await?;
                 }
             }
             Err(e) => {
@@ -245,6 +280,42 @@ impl Agent {
             }
         }
         Ok(())
+    }
+
+    /// The configured system prompt, plus — when a finish schema is set —
+    /// the instruction stating the required final-answer format. Both are
+    /// part of the request and visible in traces.
+    fn system_prompt(&self) -> Option<String> {
+        let Some(finish) = &self.finish else { return self.system.clone() };
+        let rule = format!(
+            "When you have finished, reply with only a JSON object (no other text) that matches this JSON Schema:\n{}",
+            finish.schema
+        );
+        Some(match &self.system {
+            Some(s) => format!("{s}\n\n{rule}"),
+            None => rule,
+        })
+    }
+
+    /// Complete the run, enforcing the finish schema if there is one.
+    async fn finish(&self, state: &mut RunState, step: u32, text: String) -> Result<(), AgentError> {
+        let Some(finish) = &self.finish else {
+            return self.emit(state, EventKind::RunCompleted { output: text, structured: None }).await;
+        };
+        match finish.check(&text) {
+            Ok(value) => self.emit(state, EventKind::RunCompleted { output: text, structured: Some(value) }).await,
+            Err(reason) if state.finish_rejections < finish.retries => {
+                self.emit(state, EventKind::FinishRejected { step, reason }).await
+            }
+            Err(reason) => {
+                let error = format!(
+                    "final answer did not match the finish schema after {} retr{}: {reason}",
+                    finish.retries,
+                    if finish.retries == 1 { "y" } else { "ies" }
+                );
+                self.emit(state, EventKind::RunFailed { error }).await
+            }
+        }
     }
 
     /// Streams deltas to the observer. Only the completed response is
@@ -368,6 +439,8 @@ pub struct AgentBuilder {
     provider_options: BTreeMap<String, Value>,
     on_delta: Option<DeltaFn>,
     tool_timeout: Option<Duration>,
+    finish_schema: Option<Value>,
+    finish_retries: u32,
 }
 
 impl AgentBuilder {
@@ -438,6 +511,31 @@ impl AgentBuilder {
         self
     }
 
+    /// Require the run's final answer to be JSON matching `schema` (JSON
+    /// Schema). The schema is added to the system prompt; an answer that does
+    /// not match gets [`finish_retries`](Self::finish_retries) corrective
+    /// retries (default 1), after which the run fails. The validated value
+    /// is available as [`RunOutcome::structured`].
+    pub fn finish_schema(mut self, schema: Value) -> Self {
+        self.finish_schema = Some(schema);
+        self
+    }
+
+    /// [`finish_schema`](Self::finish_schema) derived from a Rust type.
+    pub fn finish_as<T: schemars::JsonSchema>(self) -> Self {
+        let mut schema = serde_json::to_value(schemars::schema_for!(T)).unwrap_or(Value::Null);
+        if let Value::Object(map) = &mut schema {
+            map.remove("$schema");
+        }
+        self.finish_schema(schema)
+    }
+
+    /// Corrective retries allowed for a final answer that fails the schema.
+    pub fn finish_retries(mut self, n: u32) -> Self {
+        self.finish_retries = n;
+        self
+    }
+
     /// Remove the default tool timeout (per-tool timeouts still apply).
     pub fn without_tool_timeout(mut self) -> Self {
         self.tool_timeout = None;
@@ -457,6 +555,14 @@ impl AgentBuilder {
                 )));
             }
         }
+        let finish = match self.finish_schema {
+            Some(schema) => {
+                let validator = jsonschema::validator_for(&schema)
+                    .map_err(|e| AgentError::Config(format!("invalid finish schema: {e}")))?;
+                Some(FinishSchema { schema, validator, retries: self.finish_retries })
+            }
+            None => None,
+        };
         let mut seen = std::collections::HashSet::new();
         for t in &self.tools {
             if !seen.insert(t.spec().name.clone()) {
@@ -476,6 +582,7 @@ impl AgentBuilder {
             provider_options: self.provider_options,
             on_delta: self.on_delta,
             tool_timeout: self.tool_timeout,
+            finish,
         })
     }
 }

@@ -566,3 +566,94 @@ mod budget_cap {
         assert!(two < one, "a two-model chain must leave room for both attempts: {two} vs {one}");
     }
 }
+
+mod finish_schema {
+    use super::*;
+
+    #[derive(Debug, Deserialize, JsonSchema, PartialEq)]
+    struct Handoff {
+        summary: String,
+        work: String,
+        risks: Vec<String>,
+        /// 0.0 – 1.0
+        #[schemars(range(min = 0.0, max = 1.0))]
+        confidence: f64,
+    }
+
+    const GOOD: &str = r#"{"summary":"Fixed login","work":"Patched session expiry","risks":["sessions reset once"],"confidence":0.9}"#;
+
+    fn agent(model: Arc<ScriptedModel>) -> Agent {
+        Agent::builder("worker")
+            .model(model)
+            .system("You are a WhatsTask worker.")
+            .tool(counting_tool("lookup", Effect::Read, Arc::new(AtomicU32::new(0))))
+            .finish_as::<Handoff>()
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn valid_handoff_completes_with_structured_output() {
+        let model = Arc::new(ScriptedModel::new(vec![
+            tool_call_response(&[("c1", "lookup", json!({"id": 1}))]),
+            text_response(&format!("Done!\n```json\n{GOOD}\n```")),
+        ]));
+        let out = agent(model.clone()).run("fix login").await.unwrap();
+        let handoff: Handoff = out.output_as().unwrap().unwrap();
+        assert_eq!(handoff.risks, ["sessions reset once"]);
+
+        let system = model.requests()[0].system.clone().unwrap();
+        assert!(system.starts_with("You are a WhatsTask worker."));
+        assert!(system.contains("\"risks\"") && system.contains("only a JSON object"), "{system}");
+    }
+
+    #[tokio::test]
+    async fn missing_risks_gets_one_corrective_retry() {
+        let model = Arc::new(ScriptedModel::new(vec![
+            text_response(r#"{"summary":"Fixed login","work":"Patched","confidence":0.9}"#),
+            text_response(GOOD),
+        ]));
+        let agent = agent(model.clone());
+        let out = agent.run("fix login").await.unwrap();
+        assert!(out.structured.is_some());
+
+        let correction = model.requests()[1].messages.last().unwrap().text();
+        assert!(correction.contains("rejected") && correction.contains("risks"), "{correction}");
+        let events = agent.journal().load(&out.run_id).await.unwrap();
+        assert_eq!(events.iter().filter(|e| matches!(e.kind, EventKind::FinishRejected { .. })).count(), 1);
+    }
+
+    #[tokio::test]
+    async fn fails_after_retry_and_validates_more_than_presence() {
+        // Second answer has every field but confidence is out of range.
+        let model = Arc::new(ScriptedModel::new(vec![
+            text_response("I fixed it, trust me."),
+            text_response(r#"{"summary":"s","work":"w","risks":[],"confidence":7}"#),
+            text_response(GOOD),
+        ]));
+        let out = agent(model.clone()).run("fix").await.unwrap();
+        let Status::Failed { error } = &out.status else { panic!("{:?}", out.status) };
+        assert!(error.contains("after 1 retry") && error.contains("/confidence"), "{error}");
+        assert_eq!(model.requests().len(), 2, "exactly one retry");
+        assert!(out.structured.is_none());
+    }
+
+    #[tokio::test]
+    async fn zero_retries_fails_immediately() {
+        let model = Arc::new(ScriptedModel::new(vec![text_response("not json")]));
+        let agent = Agent::builder("w").model(model).finish_as::<Handoff>().finish_retries(0).build().unwrap();
+        let out = agent.run("x").await.unwrap();
+        assert!(matches!(&out.status, Status::Failed { error } if error.contains("not valid JSON")));
+    }
+
+    #[test]
+    fn invalid_schema_is_a_config_error() {
+        let err = Agent::builder("w")
+            .model(ScriptedModel::new(vec![]))
+            .finish_schema(json!({"type": "not-a-type"}))
+            .build()
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("invalid finish schema"), "{err}");
+    }
+}

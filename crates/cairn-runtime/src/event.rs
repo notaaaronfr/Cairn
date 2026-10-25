@@ -68,6 +68,14 @@ pub enum EventKind {
     },
     RunCompleted {
         output: String,
+        /// The validated final answer, when the agent has a finish schema.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        structured: Option<Value>,
+    },
+    /// A final answer failed the finish schema; the model is asked again.
+    FinishRejected {
+        step: u32,
+        reason: String,
     },
     RunFailed {
         error: String,
@@ -86,6 +94,7 @@ impl EventKind {
             EventKind::ToolCompleted { .. } => "tool_completed",
             EventKind::BudgetExceeded { .. } => "budget_exceeded",
             EventKind::RunCompleted { .. } => "run_completed",
+            EventKind::FinishRejected { .. } => "finish_rejected",
             EventKind::RunFailed { .. } => "run_failed",
         }
     }

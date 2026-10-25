@@ -49,6 +49,12 @@ pub struct RunState {
     pub approvals: HashMap<String, bool>,
     /// Results gathered for the current batch of tool calls.
     pub tool_results: Vec<Content>,
+    /// Validated final answer when the agent has a finish schema.
+    #[serde(default)]
+    pub structured_output: Option<Value>,
+    /// How many final answers have been rejected by the finish schema.
+    #[serde(default)]
+    pub finish_rejections: u32,
     pub next_seq: u64,
 }
 
@@ -68,6 +74,8 @@ impl RunState {
             pending: Vec::new(),
             approvals: HashMap::new(),
             tool_results: Vec::new(),
+            structured_output: None,
+            finish_rejections: 0,
             next_seq: 0,
         };
         for event in events {
@@ -133,8 +141,16 @@ impl RunState {
             EventKind::BudgetExceeded { reason } => {
                 self.status = Status::BudgetExceeded { reason: reason.clone() };
             }
-            EventKind::RunCompleted { output } => {
+            EventKind::RunCompleted { output, structured } => {
                 self.status = Status::Completed { output: output.clone() };
+                self.structured_output = structured.clone();
+            }
+            EventKind::FinishRejected { reason, .. } => {
+                self.finish_rejections += 1;
+                self.messages.push(Message::user(format!(
+                    "Your final answer was rejected: {reason}\n\
+                     Reply again with only a JSON object that matches the required schema."
+                )));
             }
             EventKind::RunFailed { error } => {
                 self.status = Status::Failed { error: error.clone() };

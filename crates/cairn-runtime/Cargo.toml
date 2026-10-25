@@ -9,6 +9,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+jsonschema.workspace = true
 futures.workspace = true
 async-trait.workspace = true
 chrono.workspace = true
