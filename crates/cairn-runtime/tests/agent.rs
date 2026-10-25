@@ -483,6 +483,42 @@ mod usable_fallback {
     }
 
     #[tokio::test]
+    async fn keep_last_answer_lets_the_finish_retry_fix_it_on_the_cheap_model() {
+        let schema = json!({
+            "type": "object",
+            "required": ["summary", "risks"],
+            "properties": { "summary": {"type": "string"}, "risks": {"type": "string"} }
+        });
+        let k = k2(vec![
+            text_response("Here are the headlines: 1. One 2. Two"),
+            text_response(r#"{"summary": "Three headlines", "risks": "Tone unverified."}"#),
+        ]);
+        let chain = FallbackModel::new(vec![k.clone()]).require_json_fields(&["summary", "risks"]).keep_last_answer();
+        let agent = Agent::builder("t").model(chain).finish_schema(schema.clone()).build().unwrap();
+        let out = agent.run("go").await.unwrap();
+        assert!(matches!(out.status, Status::Completed { .. }), "{:?}", out.status);
+        assert_eq!(out.structured.unwrap()["summary"], "Three headlines");
+        assert_eq!(k.inner.requests().len(), 2, "one corrective retry, same model");
+
+        // Without it, the same first answer ends the run.
+        let k = k2(vec![text_response("Here are the headlines: 1. One 2. Two")]);
+        let chain = FallbackModel::new(vec![k]).require_json_fields(&["summary", "risks"]);
+        let agent = Agent::builder("t").model(chain).finish_schema(schema).build().unwrap();
+        assert!(matches!(agent.run("go").await.unwrap().status, Status::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn keep_last_answer_counts_every_attempt_once() {
+        let (k, h) = (k2(vec![text_response("")]), haiku(vec![truncated("abc")]));
+        let (agent, out) = run(FallbackModel::new(vec![k, h]).keep_last_answer()).await;
+        let resp = first_model_call(&agent, &out.run_id).await;
+        assert_eq!(resp.served_by.as_deref(), Some("anthropic:haiku"), "the last answer is the one kept");
+        assert_eq!(resp.rejected.len(), 1, "only K2's attempt is a rejection; Haiku's is the response");
+        assert_eq!(out.usage.total(), 240, "both attempts' tokens, once each");
+        assert!((out.cost_usd - 120.0 * 10.0 / 1e6).abs() < 1e-12, "{}", out.cost_usd);
+    }
+
+    #[tokio::test]
     async fn streaming_never_leaks_a_rejected_answer() {
         use std::sync::Mutex;
         let seen = Arc::new(Mutex::new(String::new()));

@@ -78,7 +78,8 @@ let haiku = Priced::new(cairn::models::from_spec("anthropic:claude-haiku-5-5")?,
 let agent = Agent::builder("worker")
     // K2 first; Haiku if K2 fails *or* its answer is cut off, empty, or missing fields.
     .model(FallbackModel::new(vec![Arc::new(k2), Arc::new(haiku)])
-        .require_json_fields(&["summary", "work", "risks", "confidence"]))
+        .require_json_fields(&["summary", "work", "risks", "confidence"])
+        .keep_last_answer())                      // if none is usable, let finish_as's retry fix the last
     .finish_as::<Handoff>()                       // can only finish with a valid handoff (1 retry)
     .budget(Budget::default().max_usd(0.25))     // refused at build() if any model is unpriced;
                                                   // each step's max_tokens shrinks to fit what's left

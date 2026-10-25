@@ -240,12 +240,25 @@ pub struct FallbackModel {
     allow_empty: bool,
     json_fields: Option<Vec<String>>,
     custom: Option<UsableFn>,
+    keep_last: bool,
 }
 
 impl FallbackModel {
     pub fn new(models: Vec<Arc<dyn Model>>) -> Self {
         assert!(!models.is_empty(), "FallbackModel needs at least one model");
-        Self { models, allow_truncated: false, allow_empty: false, json_fields: None, custom: None }
+        Self { models, allow_truncated: false, allow_empty: false, json_fields: None, custom: None, keep_last: false }
+    }
+
+    /// When every model's answer is unusable, return the last one anyway
+    /// instead of failing the call.
+    ///
+    /// For agents with a [`finish_schema`](crate::AgentBuilder::finish_schema):
+    /// a final answer that is not quite valid JSON then reaches the agent's
+    /// corrective retry, which usually fixes it on the same cheap model,
+    /// rather than ending the run. Transport and API errors still fail.
+    pub fn keep_last_answer(mut self) -> Self {
+        self.keep_last = true;
+        self
     }
 
     /// Keep answers that hit the token limit.
@@ -313,6 +326,8 @@ impl Model for FallbackModel {
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let mut last_err = None;
         let mut rejected: Vec<RejectedAttempt> = Vec::new();
+        // The most recent unusable answer, kept only for `keep_last_answer`.
+        let mut last_unusable: Option<ModelResponse> = None;
         for model in &self.models {
             match model.complete(request).await {
                 Ok(mut resp) => {
@@ -326,6 +341,10 @@ impl Model for FallbackModel {
                         Err(reason) => {
                             tracing::warn!(model = %model.id(), %reason, "unusable answer, falling back");
                             rejected.append(&mut resp.rejected);
+                            if self.keep_last {
+                                last_unusable = Some(resp.clone());
+                                last_err = None;
+                            }
                             rejected.push(RejectedAttempt {
                                 model: model.id(),
                                 reason,
@@ -352,6 +371,15 @@ impl Model for FallbackModel {
         }
         if rejected.is_empty() {
             return Err(last_err.expect("at least one model"));
+        }
+        // Every model answered and none usably: hand back the last answer, with
+        // the earlier attempts attached so budgets still count them. Its own
+        // tokens are counted once, as the response, not again as a rejection.
+        if let (Some(mut resp), None) = (last_unusable, &last_err) {
+            rejected.pop();
+            resp.rejected = rejected;
+            tracing::warn!(model = resp.served_by.as_deref().unwrap_or(""), "no usable answer; keeping the last one");
+            return Ok(resp);
         }
         // Keep the paid-for attempts on the error so budgets still see them.
         let mut reason = rejected.iter().map(|r| format!("{}: {}", r.model, r.reason)).collect::<Vec<_>>().join("; ");
