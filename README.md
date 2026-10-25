@@ -61,6 +61,25 @@ let agent = Agent::builder("support")
 Run the Postgres tests with `CAIRN_TEST_DATABASE_URL=postgres://user@host/db cargo test -p cairn-journal-postgres`
 (they are skipped when the variable is unset).
 
+### Reliability controls
+
+```rust
+let k2 = Priced::new(cairn::models::from_spec("compat:k2:IFM/K2-Horizon-375B-A23B")?, Pricing::new(0.0, 0.0));
+let haiku = Priced::new(cairn::models::from_spec("anthropic:claude-haiku-5-5")?, Pricing::new(/* $/Mtok */ 1.0, 5.0));
+
+let agent = Agent::builder("worker")
+    // K2 first; Haiku if K2 fails *or* its answer is cut off, empty, or missing fields.
+    .model(FallbackModel::new(vec![Arc::new(k2), Arc::new(haiku)])
+        .require_json_fields(&["summary", "work", "risks", "confidence"]))
+    .finish_as::<Handoff>()                       // can only finish with a valid handoff (1 retry)
+    .budget(Budget::default().max_usd(0.25))     // refused at build() if any model is unpriced;
+                                                  // each step's max_tokens shrinks to fit what's left
+    .tool(fetch_page.with_timeout(Duration::from_secs(20)))   // default tool timeout: 120s
+    .build()?;
+```
+
+(Example prices are placeholders — use your providers' current rates.)
+
 ## Principles
 
 1. **The journal is the source of truth.** Resume, replay, audit and evals all derive from it.
@@ -70,7 +89,8 @@ Run the Postgres tests with `CAIRN_TEST_DATABASE_URL=postgres://user@host/db car
    and per-provider `provider_options`.
 4. **Tools declare their effects.** `Read` / `Write` / `Irreversible` drive policy, and every
    call gets a stable idempotency key for exactly-once side effects across retries and crashes.
-5. **Hard budgets.** Steps, tokens and USD are enforced before every model call.
+5. **Hard budgets.** Steps, tokens and USD are enforced before every model call, each call's
+   answer limit is capped to what is left, and a USD budget is refused unless every model is priced.
 
 ## Layout
 
@@ -91,7 +111,12 @@ Run the Postgres tests with `CAIRN_TEST_DATABASE_URL=postgres://user@host/db car
 - [x] PostgreSQL journal — atomic compare-and-set appends, safe across processes and machines
 - [ ] Run leases so only one worker drives a run at a time (today: at-least-once tools + idempotency keys)
 - [ ] Gateway spend shared across replicas (Postgres-backed)
-- [ ] Parallel execution of read-only tools; per-tool timeouts and retries
+- [x] Budget hardening — USD budgets require pricing; per-step answer limit fits the remaining budget
+- [x] Usability-checked fallback (truncated / empty / bad JSON → next model), paid attempts still counted
+- [x] `finish_schema` — required, validated structured final answer with corrective retry
+- [x] `compat:<name>:<model>` specs for any OpenAI-compatible endpoint
+- [x] Per-tool timeouts (120s default)
+- [ ] Parallel execution of read-only tools; tool retries
 - [ ] Context engine: compaction policies, token budgets per section
 - [ ] MCP client (tools from any MCP server) with per-agent credential brokering
 - [ ] Evals: replay recorded runs against new models/prompts, score, gate CI
