@@ -147,6 +147,16 @@ impl RunState {
                 self.status = Status::Completed { output: output.clone() };
                 self.structured_output = structured.clone();
             }
+            EventKind::ContextCompacted { replaced, summary, usage, cost_usd } => {
+                self.usage.add(usage);
+                self.cost_usd += cost_usd.unwrap_or(0.0);
+                let end = (1 + replaced).min(self.messages.len());
+                self.messages.drain(1..end);
+                if let Some(task) = self.messages.first_mut() {
+                    task.content
+                        .push(Content::Text { text: format!("\n\n[Summary of earlier work in this run]\n{summary}") });
+                }
+            }
             EventKind::FinishRejected { reason, .. } => {
                 self.finish_rejections += 1;
                 self.messages.push(Message::user(format!(

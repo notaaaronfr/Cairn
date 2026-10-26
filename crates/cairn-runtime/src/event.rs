@@ -77,6 +77,16 @@ pub enum EventKind {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         structured: Option<Value>,
     },
+    /// Older messages were replaced by a summary (context compaction).
+    ContextCompacted {
+        /// Messages after the task that the summary replaces.
+        replaced: usize,
+        summary: String,
+        #[serde(default, skip_serializing_if = "is_zero_usage")]
+        usage: Usage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+    },
     /// A final answer failed the finish schema; the model is asked again.
     FinishRejected {
         step: u32,
@@ -123,6 +133,7 @@ impl EventKind {
             EventKind::BudgetExceeded { .. } => "budget_exceeded",
             EventKind::RunCompleted { .. } => "run_completed",
             EventKind::FinishRejected { .. } => "finish_rejected",
+            EventKind::ContextCompacted { .. } => "context_compacted",
             EventKind::RunFailed { .. } => "run_failed",
             EventKind::WorkflowStarted { .. } => "workflow_started",
             EventKind::StepCompleted { .. } => "step_completed",

@@ -8,6 +8,7 @@
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cairn_runtime::memory::{MemoryError, MemoryItem, MemoryStore};
 use cairn_runtime::{Event, Journal, JournalError, LeaseHolder};
 use sqlx::postgres::{PgPool, PgPoolOptions};
 
@@ -21,6 +22,16 @@ CREATE TABLE IF NOT EXISTS cairn_events (
     PRIMARY KEY (run_id, seq)
 );
 CREATE INDEX IF NOT EXISTS cairn_events_kind_at ON cairn_events (kind, at);
+CREATE TABLE IF NOT EXISTS cairn_memory (
+    id         TEXT        PRIMARY KEY,
+    scope      TEXT        NOT NULL,
+    text       TEXT        NOT NULL,
+    tags       JSONB       NOT NULL DEFAULT '[]',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    search     TSVECTOR    GENERATED ALWAYS AS (to_tsvector('simple', text)) STORED
+);
+CREATE INDEX IF NOT EXISTS cairn_memory_scope ON cairn_memory (scope, created_at DESC);
+CREATE INDEX IF NOT EXISTS cairn_memory_search ON cairn_memory USING GIN (search);
 CREATE TABLE IF NOT EXISTS cairn_leases (
     run_id     TEXT        PRIMARY KEY,
     owner      TEXT        NOT NULL,
@@ -203,5 +214,86 @@ impl Journal for PostgresJournal {
                 .await
                 .map_err(backend)?;
         rows.into_iter().map(|v| serde_json::from_value(v).map_err(|e| JournalError::Corrupt(e.to_string()))).collect()
+    }
+}
+
+/// PostgreSQL-backed long-term memory with full-text search. Shares the
+/// journal's database and schema setup.
+#[derive(Clone)]
+pub struct PostgresMemory {
+    pool: PgPool,
+}
+
+impl PostgresMemory {
+    pub async fn connect(url: &str) -> Result<Self, JournalError> {
+        Ok(Self { pool: PostgresJournal::connect(url).await?.pool })
+    }
+
+    /// Reuse a journal's pool (creates the schema if needed).
+    pub async fn from_pool(pool: PgPool) -> Result<Self, JournalError> {
+        Ok(Self { pool: PostgresJournal::from_pool(pool).await?.pool })
+    }
+}
+
+fn mem_err(e: sqlx::Error) -> MemoryError {
+    MemoryError(e.to_string())
+}
+
+#[async_trait]
+impl MemoryStore for PostgresMemory {
+    async fn remember(&self, scope: &str, text: &str, tags: &[String]) -> Result<String, MemoryError> {
+        let id = uuid::Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO cairn_memory (id, scope, text, tags) VALUES ($1, $2, $3, $4)")
+            .bind(&id)
+            .bind(scope)
+            .bind(text)
+            .bind(serde_json::json!(tags))
+            .execute(&self.pool)
+            .await
+            .map_err(mem_err)?;
+        Ok(id)
+    }
+
+    /// Ranks notes matching any query word (OR semantics), most relevant first.
+    async fn recall(&self, scope: &str, query: &str, limit: usize) -> Result<Vec<MemoryItem>, MemoryError> {
+        let words: Vec<String> =
+            query.split(|c: char| !c.is_alphanumeric()).filter(|w| w.len() > 1).map(str::to_lowercase).collect();
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let tsquery = words.join(" | ");
+        let rows: Vec<(String, String, serde_json::Value, chrono::DateTime<chrono::Utc>)> = sqlx::query_as(
+            r#"
+            SELECT id, text, tags, created_at FROM cairn_memory
+            WHERE scope = $1 AND search @@ to_tsquery('simple', $2)
+            ORDER BY ts_rank(search, to_tsquery('simple', $2)) DESC, created_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(scope)
+        .bind(&tsquery)
+        .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(mem_err)?;
+        Ok(rows
+            .into_iter()
+            .map(|(id, text, tags, created_at)| MemoryItem {
+                id,
+                text,
+                tags: serde_json::from_value(tags).unwrap_or_default(),
+                created_at,
+            })
+            .collect())
+    }
+
+    async fn forget(&self, scope: &str, id: &str) -> Result<bool, MemoryError> {
+        let r = sqlx::query("DELETE FROM cairn_memory WHERE scope = $1 AND id = $2")
+            .bind(scope)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(mem_err)?;
+        Ok(r.rows_affected() == 1)
     }
 }

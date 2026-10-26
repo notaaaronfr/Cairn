@@ -177,3 +177,31 @@ async fn expired_lease_is_taken_over_using_the_database_clock() {
     j.release_lease(&run, "b").await.unwrap();
     assert!(j.acquire_lease(&run, "c", ttl).await.unwrap().is_ok());
 }
+
+#[tokio::test]
+async fn memory_full_text_recall_and_run_listing() {
+    use cairn_journal_postgres::PostgresMemory;
+    use cairn_runtime::memory::MemoryStore;
+    let j = require_db!();
+    let mem = PostgresMemory::from_pool(j.pool().clone()).await.unwrap();
+    let scope = format!("customer-{}", new_run_id());
+    mem.remember(&scope, "Prefers express shipping to the Berlin office", &["shipping".into()]).await.unwrap();
+    let invoice = mem.remember(&scope, "Invoices go to accounts@example.com", &[]).await.unwrap();
+    mem.remember("someone-else", "Prefers standard shipping", &[]).await.unwrap();
+
+    let hits = mem.recall(&scope, "Which shipping option does the customer prefer?", 5).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert!(hits[0].text.contains("express"));
+    assert_eq!(hits[0].tags, ["shipping"]);
+    assert!(mem.recall(&scope, "?!", 5).await.unwrap().is_empty());
+    assert!(mem.forget(&scope, &invoice).await.unwrap());
+    assert!(mem.recall(&scope, "invoices", 5).await.unwrap().is_empty());
+
+    // list_runs: most recently active first.
+    let (a, b) = (new_run_id(), new_run_id());
+    j.append(&event(&a, 0)).await.unwrap();
+    j.append(&event(&b, 0)).await.unwrap();
+    let recent = j.list_runs(50).await.unwrap();
+    let pos = |id: &str| recent.iter().position(|r| r == id).unwrap();
+    assert!(pos(&b) < pos(&a));
+}

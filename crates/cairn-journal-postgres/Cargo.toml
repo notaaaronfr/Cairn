@@ -12,6 +12,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+uuid.workspace = true
 chrono.workspace = true
 cairn-runtime.workspace = true
 async-trait.workspace = true
@@ -23,4 +24,3 @@ chrono.workspace = true
 schemars.workspace = true
 serde.workspace = true
 tokio.workspace = true
-uuid.workspace = true
