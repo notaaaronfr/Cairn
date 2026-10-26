@@ -27,9 +27,8 @@ pub use event::{Event, EventKind};
 pub use journal::{InMemoryJournal, Journal, JournalError, JsonlJournal, LeaseHolder};
 pub use message::{Content, Message, Role};
 pub use model::{
-    FallbackModel, Model, ModelError, ModelRequest, ModelResponse, ModelStream, RejectedAttempt, StopReason, StreamEvent,
-    Usage,
-    synthesize_stream,
+    FallbackModel, Model, ModelError, ModelRequest, ModelResponse, ModelStream, RejectedAttempt, StopReason,
+    StreamEvent, Usage, synthesize_stream,
 };
 pub use policy::{AllowAll, Decision, EffectPolicy, Policy};
 pub use pricing::{Priced, Pricing};

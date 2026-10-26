@@ -14,7 +14,9 @@ fn handle(msg: &Value) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let method = msg["method"].as_str()?;
     let result = match method {
-        "initialize" => json!({"protocolVersion": "2025-06-18", "serverInfo": {"name": "whatstask-fake"}, "capabilities": {"tools": {}}}),
+        "initialize" => {
+            json!({"protocolVersion": "2025-06-18", "serverInfo": {"name": "whatstask-fake"}, "capabilities": {"tools": {}}})
+        }
         "tools/list" if msg["params"]["cursor"] == "p2" => json!({"tools": [
             {"name": "submit_work", "description": "Submit work", "inputSchema": {"type": "object", "properties": {"task_id": {"type": "string"}}}},
             {"name": "escalate", "description": "Escalate", "annotations": {"destructiveHint": false}},
@@ -28,10 +30,16 @@ fn handle(msg: &Value) -> Option<Value> {
             match msg["params"]["name"].as_str().unwrap_or_default() {
                 "list_my_tasks" => json!({"content": [{"type": "text", "text": "2 tasks"}],
                                           "structuredContent": {"tasks": [{"id": "T-1"}, {"id": "T-2"}], "meta": meta}}),
-                "submit_work" => json!({"content": [{"type": "text", "text": format!("submitted {}", msg["params"]["arguments"]["task_id"])}]}),
+                "submit_work" => {
+                    json!({"content": [{"type": "text", "text": format!("submitted {}", msg["params"]["arguments"]["task_id"])}]})
+                }
                 "escalate" => json!({"isError": true, "content": [{"type": "text", "text": "no manager assigned"}]}),
                 "hang" => return None,
-                other => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("unknown tool {other}")}})),
+                other => {
+                    return Some(
+                        json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32602, "message": format!("unknown tool {other}")}}),
+                    );
+                }
             }
         }
         _ => return Some(json!({"jsonrpc": "2.0", "id": id, "error": {"code": -32601, "message": "nope"}})),
@@ -50,7 +58,10 @@ async fn fake_server(reader: tokio::io::DuplexStream, mut writer: tokio::io::Dup
         if msg["method"] == "tools/call" && !pinged {
             pinged = true;
             writer.write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"srv-1\",\"method\":\"ping\"}\n").await.unwrap();
-            writer.write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n").await.unwrap();
+            writer
+                .write_all(b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n")
+                .await
+                .unwrap();
         }
         if let Some(reply) = handle(&msg) {
             writer.write_all(format!("{reply}\n").as_bytes()).await.unwrap();
@@ -88,8 +99,8 @@ async fn handshake_pagination_and_effects() {
         [
             ("wt_list_my_tasks".into(), Effect::Read),
             ("wt_get_task".into(), Effect::Read),
-            ("wt_submit_work".into(), Effect::Write),       // overridden
-            ("wt_escalate".into(), Effect::Write),          // destructiveHint: false
+            ("wt_submit_work".into(), Effect::Write), // overridden
+            ("wt_escalate".into(), Effect::Write),    // destructiveHint: false
         ]
     );
     let err = client.tools(ToolOptions::default().only(["list_my_tasks", "delete_everything"])).await.err().unwrap();
@@ -115,7 +126,9 @@ async fn agent_uses_mcp_tools_end_to_end() {
     assert_eq!(content["meta"]["cairn/idempotency_key"], ToolCtx::new(&out.run_id, "c1").idempotency_key);
 
     let results = &requests[2].messages[4].content;
-    assert!(matches!(&results[0], Content::ToolResult { content, is_error: false, .. } if content == "submitted \"T-1\""));
+    assert!(
+        matches!(&results[0], Content::ToolResult { content, is_error: false, .. } if content == "submitted \"T-1\"")
+    );
     assert!(matches!(&results[1], Content::ToolResult { content, is_error: true, .. }
         if content["error"].as_str().unwrap().contains("no manager assigned")));
 

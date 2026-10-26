@@ -45,7 +45,12 @@ pub trait Journal: Send + Sync {
 
     /// Take (or re-take) the lease on `run_id` for `ttl`. Returns the current
     /// holder if another live owner has it.
-    async fn acquire_lease(&self, _run_id: &str, _owner: &str, _ttl: Duration) -> Result<Result<(), LeaseHolder>, JournalError> {
+    async fn acquire_lease(
+        &self,
+        _run_id: &str,
+        _owner: &str,
+        _ttl: Duration,
+    ) -> Result<Result<(), LeaseHolder>, JournalError> {
         Ok(Ok(()))
     }
 
@@ -125,7 +130,12 @@ impl Journal for InMemoryJournal {
         Ok(self.runs.lock().await.get(run_id).cloned().unwrap_or_default())
     }
 
-    async fn acquire_lease(&self, run_id: &str, owner: &str, ttl: Duration) -> Result<Result<(), LeaseHolder>, JournalError> {
+    async fn acquire_lease(
+        &self,
+        run_id: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<Result<(), LeaseHolder>, JournalError> {
         Ok(self.leases.acquire(run_id, owner, ttl))
     }
 
@@ -189,11 +199,8 @@ impl Journal for JsonlJournal {
 
         let mut line = serde_json::to_vec(event).map_err(|e| JournalError::Corrupt(e.to_string()))?;
         line.push(b'\n');
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.path_for(&event.run_id))
-            .await?;
+        let mut file =
+            tokio::fs::OpenOptions::new().create(true).append(true).open(self.path_for(&event.run_id)).await?;
         file.write_all(&line).await?;
         file.sync_data().await?;
 
@@ -209,7 +216,12 @@ impl Journal for JsonlJournal {
         }
     }
 
-    async fn acquire_lease(&self, run_id: &str, owner: &str, ttl: Duration) -> Result<Result<(), LeaseHolder>, JournalError> {
+    async fn acquire_lease(
+        &self,
+        run_id: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<Result<(), LeaseHolder>, JournalError> {
         Ok(self.leases.acquire(run_id, owner, ttl))
     }
 

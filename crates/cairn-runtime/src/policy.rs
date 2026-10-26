@@ -39,9 +39,9 @@ impl Default for EffectPolicy {
 impl Policy for EffectPolicy {
     fn decide(&self, spec: &ToolSpec, _input: &Value) -> Decision {
         match self.approve_at {
-            Some(level) if spec.effect >= level => Decision::RequireApproval {
-                reason: format!("`{}` has {:?} effect", spec.name, spec.effect),
-            },
+            Some(level) if spec.effect >= level => {
+                Decision::RequireApproval { reason: format!("`{}` has {:?} effect", spec.name, spec.effect) }
+            }
             _ => Decision::Allow,
         }
     }

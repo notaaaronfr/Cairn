@@ -74,33 +74,36 @@ where
 {
     let sse = Box::pin(sse);
     let state = (sse, acc, VecDeque::<StreamEvent>::new(), false, false);
-    Box::pin(futures::stream::unfold(state, move |(mut sse, mut acc, mut queue, mut ended, mut completed)| async move {
-        loop {
-            if let Some(ev) = queue.pop_front() {
-                if matches!(ev, StreamEvent::Completed(_)) {
-                    completed = true;
+    Box::pin(futures::stream::unfold(
+        state,
+        move |(mut sse, mut acc, mut queue, mut ended, mut completed)| async move {
+            loop {
+                if let Some(ev) = queue.pop_front() {
+                    if matches!(ev, StreamEvent::Completed(_)) {
+                        completed = true;
+                    }
+                    return Some((Ok(ev), (sse, acc, queue, ended, completed)));
                 }
-                return Some((Ok(ev), (sse, acc, queue, ended, completed)));
-            }
-            if ended || completed {
-                return None;
-            }
-            match sse.next().await {
-                Some(Ok(raw)) => match step(&mut acc, raw) {
-                    Ok(evs) => queue.extend(evs),
-                    Err(e) => return Some((Err(e), (sse, acc, queue, true, completed))),
-                },
-                Some(Err(e)) => return Some((Err(e), (sse, acc, queue, true, completed))),
-                None => {
-                    ended = true;
-                    match end(&mut acc) {
+                if ended || completed {
+                    return None;
+                }
+                match sse.next().await {
+                    Some(Ok(raw)) => match step(&mut acc, raw) {
                         Ok(evs) => queue.extend(evs),
                         Err(e) => return Some((Err(e), (sse, acc, queue, true, completed))),
+                    },
+                    Some(Err(e)) => return Some((Err(e), (sse, acc, queue, true, completed))),
+                    None => {
+                        ended = true;
+                        match end(&mut acc) {
+                            Ok(evs) => queue.extend(evs),
+                            Err(e) => return Some((Err(e), (sse, acc, queue, true, completed))),
+                        }
                     }
                 }
             }
-        }
-    }))
+        },
+    ))
 }
 
 /// Error for a non-2xx response to a streaming request.

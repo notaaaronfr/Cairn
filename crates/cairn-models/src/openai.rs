@@ -57,7 +57,26 @@ impl OpenAiCompatModel {
         self
     }
 
+    /// Reasoning this adapter's own provider produced, as opposed to another
+    /// provider's earlier in a fallback chain.
+    fn own_reasoning<'a>(&self, c: &'a Content) -> Option<&'a str> {
+        match c {
+            Content::Thinking { text, provider_data }
+                if provider_data.as_ref().and_then(|d| d["provider"].as_str()) == Some(self.provider.as_str()) =>
+            {
+                Some(text.as_str())
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn build_body(&self, req: &ModelRequest) -> Value {
+        // Reasoning models (IFM's K2, DeepSeek and others) return
+        // `reasoning_content` and refuse a later turn unless every assistant
+        // message carries it back verbatim. Once this provider has returned
+        // any, replay it on every assistant message: its own text where there
+        // is some, "" where another model wrote the turn.
+        let replay_reasoning = req.messages.iter().flat_map(|m| &m.content).any(|c| self.own_reasoning(c).is_some());
         let mut messages = Vec::new();
         if let Some(system) = &req.system {
             messages.push(json!({ "role": "system", "content": system }));
@@ -102,6 +121,10 @@ impl OpenAiCompatModel {
                     if !calls.is_empty() {
                         msg["tool_calls"] = json!(calls);
                     }
+                    if replay_reasoning {
+                        let r: String = m.content.iter().filter_map(|c| self.own_reasoning(c)).collect();
+                        msg["reasoning_content"] = json!(r);
+                    }
                     messages.push(msg);
                 }
             }
@@ -135,8 +158,12 @@ impl OpenAiCompatModel {
         }
 
         let mut content = Vec::new();
-        if let Some(r) = msg["reasoning_content"].as_str().filter(|s| !s.is_empty()) {
-            content.push(Content::Thinking { text: r.to_owned(), provider_data: Some(json!({ "provider": self.provider })) });
+        // Kept even when empty: "" is a value such providers expect back.
+        if let Some(r) = msg["reasoning_content"].as_str().or_else(|| msg["reasoning"].as_str()) {
+            content.push(Content::Thinking {
+                text: r.to_owned(),
+                provider_data: Some(json!({ "provider": self.provider })),
+            });
         }
         if let Some(t) = msg["content"].as_str().filter(|s| !s.is_empty()) {
             content.push(Content::Text { text: t.to_owned() });
@@ -216,6 +243,8 @@ pub(crate) struct StreamAcc {
     model: String,
     text: String,
     reasoning: String,
+    /// Whether the stream carried a reasoning field at all, even an empty one.
+    saw_reasoning: bool,
     /// (id, name, arguments) per tool-call index.
     tools: Vec<(String, String, String)>,
     finish: Option<String>,
@@ -251,9 +280,12 @@ impl StreamAcc {
         let mut out = Vec::new();
         let choice = &v["choices"][0];
         let delta = &choice["delta"];
-        if let Some(r) = delta["reasoning_content"].as_str().filter(|s| !s.is_empty()) {
-            self.reasoning.push_str(r);
-            out.push(StreamEvent::ThinkingDelta(r.to_owned()));
+        if let Some(r) = delta["reasoning_content"].as_str().or_else(|| delta["reasoning"].as_str()) {
+            self.saw_reasoning = true;
+            if !r.is_empty() {
+                self.reasoning.push_str(r);
+                out.push(StreamEvent::ThinkingDelta(r.to_owned()));
+            }
         }
         if let Some(t) = delta["content"].as_str().filter(|s| !s.is_empty()) {
             self.text.push_str(t);
@@ -299,7 +331,7 @@ impl StreamAcc {
         }
         self.done = true;
         let mut content = Vec::new();
-        if !self.reasoning.is_empty() {
+        if self.saw_reasoning || !self.reasoning.is_empty() {
             content.push(Content::Thinking {
                 text: std::mem::take(&mut self.reasoning),
                 provider_data: Some(json!({ "provider": self.provider })),
@@ -339,6 +371,58 @@ mod tests {
     use cairn_runtime::Message;
 
     #[test]
+    fn reasoning_is_replayed_verbatim_once_the_provider_returns_it() {
+        let m = OpenAiCompatModel::new("k2", "IFM/K2", "https://example.invalid/v1", None::<String>);
+        let first = m
+            .parse_response(&json!({"model": "IFM/K2", "choices": [{"finish_reason": "stop",
+                "message": {"content": "Hello", "reasoning_content": "think think"}}]}))
+            .unwrap();
+        let empty = m
+            .parse_response(&json!({"model": "IFM/K2", "choices": [{"finish_reason": "stop",
+                "message": {"content": "Again", "reasoning_content": ""}}]}))
+            .unwrap();
+        let req = ModelRequest {
+            messages: vec![
+                Message::user("a"),
+                Message::assistant(first.content),
+                Message::user("b"),
+                // A turn another model wrote, after a fallback.
+                Message::assistant(vec![Content::Text { text: "from haiku".into() }]),
+                Message::user("c"),
+                Message::assistant(empty.content),
+                Message::user("d"),
+            ],
+            max_tokens: 10,
+            ..Default::default()
+        };
+        let msgs = m.build_body(&req)["messages"].as_array().unwrap().clone();
+        assert_eq!(msgs[1]["reasoning_content"], "think think");
+        assert_eq!(msgs[1]["content"], "Hello", "reasoning never leaks into the content");
+        assert_eq!(msgs[3]["reasoning_content"], "", "another model's turn carries an empty one");
+        assert_eq!(msgs[5]["reasoning_content"], "", "an empty one is kept, not dropped");
+    }
+
+    #[test]
+    fn providers_without_reasoning_get_no_reasoning_field() {
+        let m = OpenAiCompatModel::openai("gpt-x", "k");
+        let req = ModelRequest {
+            messages: vec![
+                Message::user("a"),
+                Message::assistant(vec![
+                    // Another provider's thinking is not this one's to replay.
+                    Content::Thinking { text: "x".into(), provider_data: Some(json!({"provider": "anthropic"})) },
+                    Content::Text { text: "hi".into() },
+                ]),
+                Message::user("b"),
+            ],
+            max_tokens: 10,
+            ..Default::default()
+        };
+        let msgs = m.build_body(&req)["messages"].as_array().unwrap().clone();
+        assert!(msgs[1].get("reasoning_content").is_none());
+    }
+
+    #[test]
     fn round_trips_tool_calls() {
         let m = OpenAiCompatModel::openai("gpt-x", "k");
         let req = ModelRequest {
@@ -351,7 +435,11 @@ mod tests {
                 ]),
                 Message {
                     role: Role::User,
-                    content: vec![Content::ToolResult { tool_use_id: "c1".into(), content: json!("ok"), is_error: false }],
+                    content: vec![Content::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: json!("ok"),
+                        is_error: false,
+                    }],
                 },
             ],
             max_tokens: 50,
@@ -403,8 +491,7 @@ data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":9,"prompt_to
 data: [DONE]
 "#;
         let mut acc = StreamAcc { provider: "openai".into(), ..Default::default() };
-        let events: Vec<StreamEvent> =
-            sse::parse_text(raw).into_iter().flat_map(|e| acc.step(e).unwrap()).collect();
+        let events: Vec<StreamEvent> = sse::parse_text(raw).into_iter().flat_map(|e| acc.step(e).unwrap()).collect();
         assert_eq!(events[0], StreamEvent::TextDelta("Check".into()));
         assert!(events.contains(&StreamEvent::ToolCallStart { index: 1, id: "c2".into(), name: "b".into() }));
         let StreamEvent::Completed(r) = events.last().unwrap() else { panic!("no completion") };

@@ -4,7 +4,10 @@ use cairn_gateway::{Config, Gateway};
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "cairn-gateway", about = "Drop-in OpenAI/Anthropic-compatible gateway with budgets, failover and audit")]
+#[command(
+    name = "cairn-gateway",
+    about = "Drop-in OpenAI/Anthropic-compatible gateway with budgets, failover and audit"
+)]
 struct Args {
     #[arg(long, short, default_value = "gateway.toml")]
     config: PathBuf,

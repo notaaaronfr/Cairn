@@ -29,7 +29,12 @@ macro_rules! require_db {
 }
 
 fn event(run_id: &str, seq: u64) -> Event {
-    Event { run_id: run_id.into(), seq, at: chrono::Utc::now(), kind: EventKind::RunFailed { error: format!("e{seq}") } }
+    Event {
+        run_id: run_id.into(),
+        seq,
+        at: chrono::Utc::now(),
+        kind: EventKind::RunFailed { error: format!("e{seq}") },
+    }
 }
 
 fn new_run_id() -> String {

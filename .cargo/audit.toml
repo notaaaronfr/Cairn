@@ -1,0 +1,7 @@
+[advisories]
+# RUSTSEC-2023-0071 (rsa, Marvin timing attack; no fixed release exists).
+# rsa reaches Cargo.lock only through sqlx-mysql, which sqlx lists for its
+# macros; Cairn enables only sqlx's Postgres driver, and neither crate is
+# compiled for any target or feature (`cargo tree -i rsa --all-features
+# --target all` is empty). Re-check when upgrading sqlx.
+ignore = ["RUSTSEC-2023-0071"]

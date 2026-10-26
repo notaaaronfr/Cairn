@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
 use cairn_runtime::{Content, Event, EventKind, JsonlJournal, RunState};
+use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
 #[command(name = "cairn", about = "Inspect and time-travel through Cairn run journals")]

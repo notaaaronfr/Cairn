@@ -164,7 +164,9 @@ impl Tool for ReplayTool {
         };
         if let Some(r) = hit {
             return if r.is_error {
-                Err(ToolError::new(r.output["error"].as_str().map(str::to_owned).unwrap_or_else(|| r.output.to_string())))
+                Err(ToolError::new(
+                    r.output["error"].as_str().map(str::to_owned).unwrap_or_else(|| r.output.to_string()),
+                ))
             } else {
                 Ok(r.output)
             };
@@ -232,9 +234,13 @@ impl Scorer for FieldsMatch {
         let (Some(b), Some(s)) = (&case.baseline.structured, &c.structured) else {
             return Score::new(0.0, "missing structured output");
         };
-        let differing: Vec<&str> = self.0.iter().filter(|f| b[f.as_str()] != s[f.as_str()]).map(String::as_str).collect();
+        let differing: Vec<&str> =
+            self.0.iter().filter(|f| b[f.as_str()] != s[f.as_str()]).map(String::as_str).collect();
         let value = 1.0 - differing.len() as f64 / self.0.len().max(1) as f64;
-        Score::new(value, if differing.is_empty() { "all match".into() } else { format!("differs: {}", differing.join(", ")) })
+        Score::new(
+            value,
+            if differing.is_empty() { "all match".into() } else { format!("differs: {}", differing.join(", ")) },
+        )
     }
 }
 
@@ -258,7 +264,11 @@ impl Scorer for Judge {
 
     async fn score(&self, case: &EvalCase, c: &RunSummary) -> Score {
         let answer = |s: &RunSummary| {
-            s.structured.as_ref().map(Value::to_string).or_else(|| s.output.clone()).unwrap_or_else(|| "(no answer)".into())
+            s.structured
+                .as_ref()
+                .map(Value::to_string)
+                .or_else(|| s.output.clone())
+                .unwrap_or_else(|| "(no answer)".into())
         };
         let prompt = format!(
             "Grade a candidate answer against a reference answer to the same task.\n\nRubric: {}\n\n\
@@ -269,7 +279,8 @@ impl Scorer for Judge {
             answer(&case.baseline),
             answer(c),
         );
-        let request = crate::model::ModelRequest { messages: vec![Message::user(prompt)], max_tokens: 512, ..Default::default() };
+        let request =
+            crate::model::ModelRequest { messages: vec![Message::user(prompt)], max_tokens: 512, ..Default::default() };
         match self.model.complete(&request).await {
             Ok(resp) => {
                 let cost = self.model.cost_usd(&resp).unwrap_or(0.0);
@@ -307,11 +318,8 @@ impl EvalReport {
         if self.cases.is_empty() {
             return 0.0;
         }
-        let total: f64 = self
-            .cases
-            .iter()
-            .map(|c| c.scores.iter().find(|(n, _)| n == scorer).map_or(0.0, |(_, s)| s.value))
-            .sum();
+        let total: f64 =
+            self.cases.iter().map(|c| c.scores.iter().find(|(n, _)| n == scorer).map_or(0.0, |(_, s)| s.value)).sum();
         total / self.cases.len() as f64
     }
 
@@ -336,7 +344,9 @@ impl EvalReport {
     pub fn candidate_cost(&self) -> f64 {
         self.cases
             .iter()
-            .map(|c| c.candidate.as_ref().map_or(0.0, |r| r.cost_usd) + c.scores.iter().map(|(_, s)| s.cost_usd).sum::<f64>())
+            .map(|c| {
+                c.candidate.as_ref().map_or(0.0, |r| r.cost_usd) + c.scores.iter().map(|(_, s)| s.cost_usd).sum::<f64>()
+            })
             .sum()
     }
 
@@ -414,7 +424,8 @@ impl Evaluator {
             .iter()
             .map(|t| {
                 let recorded = case.recordings.iter().filter(|r| r.tool == t.spec().name).cloned().collect();
-                Arc::new(ReplayTool { inner: t.clone(), recorded: Mutex::new(recorded), live: self.live }) as Arc<dyn Tool>
+                Arc::new(ReplayTool { inner: t.clone(), recorded: Mutex::new(recorded), live: self.live })
+                    as Arc<dyn Tool>
             })
             .collect();
         let agent = builder
@@ -435,7 +446,13 @@ impl Evaluator {
                 for s in &self.scorers {
                     scores.push((s.name(), s.score(case, &candidate).await));
                 }
-                CaseResult { run_id: case.run_id.clone(), baseline: case.baseline.clone(), candidate: Some(candidate), scores, error: None }
+                CaseResult {
+                    run_id: case.run_id.clone(),
+                    baseline: case.baseline.clone(),
+                    candidate: Some(candidate),
+                    scores,
+                    error: None,
+                }
             }
             Err(error) => CaseResult {
                 run_id: case.run_id.clone(),

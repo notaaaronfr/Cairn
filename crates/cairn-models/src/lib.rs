@@ -11,8 +11,8 @@ mod openai;
 mod sse;
 
 pub use anthropic::AnthropicModel;
-pub use openai::OpenAiCompatModel;
 pub use cairn_runtime::{Priced, Pricing};
+pub use openai::OpenAiCompatModel;
 
 use std::sync::Arc;
 

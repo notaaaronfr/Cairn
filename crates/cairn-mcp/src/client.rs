@@ -68,11 +68,7 @@ impl Drop for InFlight {
 
 impl McpClient {
     /// Spawn a local MCP server and talk to it over stdio.
-    pub async fn connect_stdio<I, K, V>(
-        command: &str,
-        args: &[&str],
-        env: I,
-    ) -> Result<Arc<Self>, McpError>
+    pub async fn connect_stdio<I, K, V>(command: &str, args: &[&str], env: I) -> Result<Arc<Self>, McpError>
     where
         I: IntoIterator<Item = (K, V)>,
         K: AsRef<std::ffi::OsStr>,

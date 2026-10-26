@@ -39,19 +39,23 @@ struct Refund {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let get_order = tool("get_order", "Look up an order by id.", Effect::Read, |i: GetOrder, _ctx| async move {
-        Ok(Order { order_id: i.order_id, item: "Noise-cancelling headphones".into(), total_usd: 249.0, status: "delivered, damaged".into() })
+        Ok(Order {
+            order_id: i.order_id,
+            item: "Noise-cancelling headphones".into(),
+            total_usd: 249.0,
+            status: "delivered, damaged".into(),
+        })
     });
 
-    let refund = tool(
-        "refund",
-        "Refund an order. Irreversible.",
-        Effect::Irreversible,
-        |i: Refund, ctx: ToolCtx| async move {
+    let refund =
+        tool("refund", "Refund an order. Irreversible.", Effect::Irreversible, |i: Refund, ctx: ToolCtx| async move {
             // Pass ctx.idempotency_key to the payment provider for exactly-once refunds.
-            println!("  💸 refunding ${:.2} on order {} ({}) [idempotency key {}]", i.amount_usd, i.order_id, i.reason, ctx.idempotency_key);
+            println!(
+                "  💸 refunding ${:.2} on order {} ({}) [idempotency key {}]",
+                i.amount_usd, i.order_id, i.reason, ctx.idempotency_key
+            );
             Ok(json!({ "refund_id": "rf_123", "status": "succeeded" }))
-        },
-    );
+        });
 
     let model: Arc<dyn Model> = match std::env::var("CAIRN_MODEL") {
         Ok(spec) => cairn::models::from_spec(&spec)?,

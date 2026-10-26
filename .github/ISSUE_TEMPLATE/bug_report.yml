@@ -1,0 +1,33 @@
+name: Bug report
+description: Something in Cairn does not work as documented
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, and what happened instead.
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Minimal reproduction
+      description: Code or steps. A `ScriptedModel` reproduction is ideal — no API keys needed.
+      render: rust
+  - type: textarea
+    id: journal
+    attributes:
+      label: Journal excerpt
+      description: Output of `cairn show <run>.jsonl` if relevant. Remove anything sensitive.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Cairn version / commit
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: Rust version, OS, model provider
