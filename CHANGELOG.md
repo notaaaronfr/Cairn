@@ -4,7 +4,7 @@ All notable changes to Cairn are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may contain breaking changes.
 
-## [Unreleased]
+## [Unreleased] — 0.2.0
 
 ### Added
 - Durable workflows (`Workflow`, `WorkflowCtx`): journaled `step` and `agent` calls, resume after
@@ -16,6 +16,10 @@ All notable changes to Cairn are documented here. The format follows
   rewrite or refuse each step; rewrites are what get journaled.
 - OpenTelemetry: `invoke_agent`, `chat` and `execute_tool` spans with GenAI semantic-convention
   attributes; `cairn::otel::init` exports them over OTLP/HTTP (feature `otel`).
+- `cairn-server`: host agents behind an HTTP API (start, inspect, time-travel, approve, resume), with
+  API-key auth, a crash-recovery loop that resumes orphaned runs, and a built-in Dev UI at `/ui`.
+- `cairn ui <dir>`: browse a directory of JSONL journals in the Dev UI.
+- `Journal::list_runs` (in-memory, JSONL and PostgreSQL journals).
 - `ToolCtx::charge` and `ToolCtx::remaining_usd` for tools that spend money; tool spend is journaled
   on `ToolCompleted` and counts toward budgets.
 

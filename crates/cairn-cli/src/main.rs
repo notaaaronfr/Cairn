@@ -21,6 +21,13 @@ enum Command {
         #[arg(long)]
         at: Option<u64>,
     },
+    /// Browse a directory of JSONL journals in the Dev UI (read-only).
+    Ui {
+        /// Directory containing <run_id>.jsonl files.
+        dir: PathBuf,
+        #[arg(long, default_value = "127.0.0.1:8790")]
+        addr: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -28,6 +35,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Show { journal } => show(&journal),
         Command::State { journal, at } => state(&journal, at),
+        Command::Ui { dir, addr } => ui(dir, &addr),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -36,6 +44,13 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn ui(dir: PathBuf, addr: &str) -> Result<(), String> {
+    let journal = JsonlJournal::new(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let runtime = tokio::runtime::Runtime::new().map_err(|e| e.to_string())?;
+    println!("Cairn Dev UI for {} at http://{addr}/ui (read-only; Ctrl-C to stop)", dir.display());
+    runtime.block_on(cairn_server::Server::new(std::sync::Arc::new(journal)).serve(addr)).map_err(|e| e.to_string())
 }
 
 fn load(path: &Path) -> Result<Vec<Event>, String> {

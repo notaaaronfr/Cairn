@@ -126,6 +126,14 @@ impl Journal for PostgresJournal {
         Err(JournalError::Conflict { run_id: event.run_id.clone(), expected: expected as u64, got: event.seq })
     }
 
+    async fn list_runs(&self, limit: usize) -> Result<Vec<String>, JournalError> {
+        sqlx::query_scalar("SELECT run_id FROM cairn_events GROUP BY run_id ORDER BY MAX(at) DESC, run_id LIMIT $1")
+            .bind(i64::try_from(limit).unwrap_or(i64::MAX))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(backend)
+    }
+
     /// Leases use the database clock, so worker clock skew does not matter.
     async fn acquire_lease(
         &self,

@@ -157,6 +157,22 @@ journaled. Every run emits `invoke_agent`, `chat` and `execute_tool` spans with 
 attributes (`gen_ai.request.model`, `gen_ai.usage.*`, `gen_ai.tool.name`, plus `cairn.cost_usd`), so
 any OTLP backend — Datadog, Grafana, Honeycomb, Jaeger, Azure Monitor — shows them.
 
+### Hosting and the Dev UI
+
+```rust
+cairn_server::Server::new(journal)                 // same journal for every replica (e.g. Postgres)
+    .agent(support).agent(billing)
+    .api_key(std::env::var("CAIRN_API_KEY")?)
+    .recover_every(Duration::from_secs(30))        // resume runs whose worker died
+    .serve("0.0.0.0:8790").await?;                 // Dev UI at /ui
+```
+
+HTTP API: start runs (`POST /v1/agents/{name}/runs`), list and inspect them, read the journal,
+time-travel (`/v1/runs/{id}/state?at=N`), approve or reject (`POST /v1/runs/{id}/approvals/{call}`),
+resume, and list pending approvals. The Dev UI shows runs, costs, a clickable timeline with the state
+at every event, and an approval inbox. Browse any JSONL journal directory without code:
+`cairn ui ./runs`.
+
 ### MCP tools
 
 ```rust
@@ -218,7 +234,8 @@ in-memory journal.
 | `cairn-gateway` | Drop-in OpenAI/Anthropic-compatible gateway: budgets, allowlists, failover, audit |
 | `cairn-journal-postgres` | PostgreSQL journal: many processes/machines can drive, approve and resume the same runs |
 | `cairn-ai-mcp` | MCP client (stdio + Streamable HTTP): any MCP server's tools as Cairn tools |
-| `cairn-ai-cli` | `cairn show` / `cairn state` journal inspector |
+| `cairn-server` | HTTP API, crash-recovery worker and Dev UI for hosting agents |
+| `cairn-ai-cli` | `cairn show` / `cairn state` / `cairn ui` journal tools |
 
 ## Roadmap
 
@@ -231,6 +248,7 @@ Done in 0.1:
 - MCP client (stdio + Streamable HTTP), evals by replay, per-tool timeouts, `compat:` model specs
 - Durable workflows: sequential, concurrent, handoff and group-chat orchestration; agents as tools
 - Middleware hooks; OpenTelemetry GenAI spans with an OTLP exporter
+- `cairn-server`: HTTP API, crash-recovery worker, Dev UI; `cairn ui` for any journal directory
 
 Next:
 
