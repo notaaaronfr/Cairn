@@ -1,12 +1,30 @@
 # Cairn
 
+[![CI](https://github.com/whatstask/Cairn/actions/workflows/ci.yml/badge.svg)](https://github.com/whatstask/Cairn/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![MSRV 1.85](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
+
 Durable, governed, model-agnostic AI agents, written in Rust.
 
+> **Status:** v0.1 — early release. The core is covered by unit, integration and PostgreSQL tests, but
+> public APIs may still change before 1.0. See [CHANGELOG.md](CHANGELOG.md).
 
 Every model call, tool call, approval and policy decision is appended to an
 event journal. Agent state is **only** a fold over that journal, so one code
 path gives you live execution, crash recovery, human-in-the-loop and
 time-travel debugging.
+
+## Install
+
+```toml
+[dependencies]
+cairn = { package = "cairn-ai", git = "https://github.com/whatstask/Cairn" }
+# optional features: "postgres" (PostgresJournal), "mcp" (MCP client)
+tokio = { version = "1", features = ["full"] }
+```
+
+Requires Rust 1.85+. The gateway and CLI are binaries in this repo
+(`cargo install --git https://github.com/whatstask/Cairn cairn-gateway cairn-ai-cli`).
 
 ## Use it from any framework today: the gateway
 
@@ -154,25 +172,27 @@ in-memory journal.
 
 ## Roadmap
 
-- [x] v0.1 — durable loop, approvals, policies, budgets, JSONL journal, Anthropic + OpenAI-compat, CLI
-- [x] Gateway — OpenAI + Anthropic wire formats, any-to-any translation, budgets, failover, audit
-- [x] True token streaming — native Anthropic + OpenAI-compatible streams, agent `on_delta`, gateway passthrough
-- [x] PostgreSQL journal — atomic compare-and-set appends, safe across processes and machines
-- [x] Run leases — one worker drives a run at a time; renewed while running, taken over after a crash
+Done in 0.1:
+
+- Durable event-sourced loop, approvals, policies, budgets, JSONL and PostgreSQL journals, CLI
+- Gateway: OpenAI + Anthropic wire formats, any-to-any translation, budgets, failover, audit
+- True token streaming across providers, the agent (`on_delta`) and the gateway
+- Run leases, `run_with_id`, budget hardening, usability-checked fallback, `finish_schema`
+- MCP client (stdio + Streamable HTTP), evals by replay, per-tool timeouts, `compat:` model specs
+
+Next:
+
 - [ ] Gateway spend shared across replicas (Postgres-backed)
-- [x] Budget hardening — USD budgets require pricing; per-step answer limit fits the remaining budget
-- [x] Usability-checked fallback (truncated / empty / bad JSON → next model), paid attempts still counted
-- [x] `finish_schema` — required, validated structured final answer with corrective retry
-- [x] `compat:<name>:<model>` specs for any OpenAI-compatible endpoint
-- [x] Per-tool timeouts (120s default)
 - [ ] Parallel execution of read-only tools; tool retries
 - [ ] Context engine: compaction policies, token budgets per section
-- [x] MCP client — stdio + Streamable HTTP, annotations → effects, cancellation, idempotency keys
 - [ ] Per-agent credential brokering for MCP (OAuth)
-- [x] Evals by replay — recorded runs on a candidate model, side-effect-safe, scorers incl. LLM judge, cost comparison
 - [ ] Sub-agents as tools; OpenTelemetry GenAI spans
 - [ ] Python (PyO3) and TypeScript (napi-rs) bindings over the same core
 
+## Contributing
+
+Issues and pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). Please report security
+issues privately as described in [SECURITY.md](SECURITY.md).
 
 Created by **Aaron David Charles** · [charlesaarondavid.com](https://charlesaarondavid.com) · `@charlesaarondavid`
 
