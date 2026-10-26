@@ -11,3 +11,6 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Tracks a moving branch (@master / @stable); nothing to bump.
+      - dependency-name: dtolnay/rust-toolchain
