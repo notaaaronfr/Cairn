@@ -1,7 +1,7 @@
 # Cairn
 
 [![CI](https://github.com/whatstask/Cairn/actions/workflows/ci.yml/badge.svg)](https://github.com/whatstask/Cairn/actions/workflows/ci.yml)
-[![crates.io](https://img.shields.io/crates/v/cairn-ai.svg)](https://crates.io/crates/cairn-ai)
+[![crates.io](https://img.shields.io/crates/v/cairn-ai.svg?cacheSeconds=3600)](https://crates.io/crates/cairn-ai)
 [![docs.rs](https://img.shields.io/docsrs/cairn-ai)](https://docs.rs/cairn-ai)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV 1.85](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
