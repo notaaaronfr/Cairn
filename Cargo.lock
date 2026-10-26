@@ -377,12 +377,18 @@ dependencies = [
  "async-trait",
  "axum",
  "cairn-runtime",
+ "chrono",
  "futures",
+ "hex",
+ "hmac",
  "reqwest 0.12.28",
+ "schemars",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -6,6 +6,10 @@ All notable changes to Cairn are documented here. The format follows
 
 ## [Unreleased] — 0.2.0
 
+### Changed
+- `gemini:` model specs now use the native Gemini API instead of its OpenAI-compatible endpoint,
+  so thought signatures survive multi-step tool use. `OpenAiCompatModel::gemini` remains available.
+
 ### Added
 - Durable workflows (`Workflow`, `WorkflowCtx`): journaled `step` and `agent` calls, resume after
   crashes and approvals, workflow-wide USD budgets that cap each child agent.
@@ -19,6 +23,9 @@ All notable changes to Cairn are documented here. The format follows
 - `cairn-server`: host agents behind an HTTP API (start, inspect, time-travel, approve, resume), with
   API-key auth, a crash-recovery loop that resumes orphaned runs, and a built-in Dev UI at `/ui`.
 - `cairn ui <dir>`: browse a directory of JSONL journals in the Dev UI.
+- Model connectors: Azure OpenAI (`azure:` spec; API keys or Microsoft Entra ID tokens), Amazon
+  Bedrock (`bedrock:` spec; Converse and ConverseStream with SigV4 or Bedrock API keys, prompt
+  caching), and a native Gemini adapter (thought signatures, streaming) that also serves Vertex AI.
 - `Journal::list_runs` (in-memory, JSONL and PostgreSQL journals).
 - `ToolCtx::charge` and `ToolCtx::remaining_usd` for tools that spend money; tool spend is journaled
   on `ToolCompleted` and counts toward budgets.
