@@ -1,6 +1,8 @@
 # Cairn
 
 [![CI](https://github.com/whatstask/Cairn/actions/workflows/ci.yml/badge.svg)](https://github.com/whatstask/Cairn/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/cairn-ai.svg)](https://crates.io/crates/cairn-ai)
+[![docs.rs](https://img.shields.io/docsrs/cairn-ai)](https://docs.rs/cairn-ai)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![MSRV 1.85](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -18,13 +20,14 @@ time-travel debugging.
 
 ```toml
 [dependencies]
-cairn = { package = "cairn-ai", git = "https://github.com/whatstask/Cairn" }
+cairn = { package = "cairn-ai", version = "0.1" }
 # optional features: "postgres" (PostgresJournal), "mcp" (MCP client)
+# latest main instead: cairn = { package = "cairn-ai", git = "https://github.com/whatstask/Cairn" }
 tokio = { version = "1", features = ["full"] }
 ```
 
 Requires Rust 1.85+. The gateway and CLI are binaries in this repo
-(`cargo install --git https://github.com/whatstask/Cairn cairn-gateway cairn-ai-cli`).
+(`cargo install cairn-gateway cairn-ai-cli`). API docs: [docs.rs/cairn-ai](https://docs.rs/cairn-ai).
 
 ## Use it from any framework today: the gateway
 

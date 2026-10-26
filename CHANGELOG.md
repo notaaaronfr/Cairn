@@ -4,7 +4,9 @@ All notable changes to Cairn are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may contain breaking changes.
 
-## [0.1.0] — Unreleased
+## [Unreleased]
+
+## [0.1.0] — 2026-10-26
 
 First public release.
 
@@ -42,4 +44,5 @@ First public release.
 ### Tooling (`cairn-ai-cli`)
 - `cairn show` (timeline) and `cairn state --at N` (state at any event) for journals.
 
+[Unreleased]: https://github.com/whatstask/Cairn/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/whatstask/Cairn/releases/tag/v0.1.0
