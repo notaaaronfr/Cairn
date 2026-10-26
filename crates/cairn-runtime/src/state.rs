@@ -135,7 +135,9 @@ impl RunState {
                     self.status = Status::Running;
                 }
             }
-            EventKind::ToolCompleted { call_id, output, is_error, .. } => {
+            EventKind::ToolCompleted { call_id, output, is_error, usage, cost_usd, .. } => {
+                self.usage.add(usage);
+                self.cost_usd += cost_usd.unwrap_or(0.0);
                 self.resolve(call_id, output.clone(), *is_error);
             }
             EventKind::BudgetExceeded { reason } => {
@@ -153,6 +155,26 @@ impl RunState {
                 )));
             }
             EventKind::RunFailed { error } => {
+                self.status = Status::Failed { error: error.clone() };
+            }
+            EventKind::WorkflowStarted { workflow, .. } => {
+                self.agent = workflow.clone();
+                self.status = Status::Running;
+            }
+            EventKind::StepCompleted { usage, cost_usd, .. } => {
+                self.steps += 1;
+                self.usage.add(usage);
+                self.cost_usd += cost_usd.unwrap_or(0.0);
+            }
+            EventKind::WorkflowCompleted { output } => {
+                let text = match output {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                self.status = Status::Completed { output: text };
+                self.structured_output = Some(output.clone());
+            }
+            EventKind::WorkflowFailed { error } => {
                 self.status = Status::Failed { error: error.clone() };
             }
         }

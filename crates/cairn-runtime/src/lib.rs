@@ -12,14 +12,17 @@ pub mod budget;
 pub mod eval;
 pub mod event;
 pub mod journal;
+pub mod lease;
 pub mod message;
 pub mod model;
 pub mod output;
 pub mod policy;
 pub mod pricing;
 pub mod state;
+pub mod subagent;
 pub mod testing;
 pub mod tool;
+pub mod workflow;
 
 pub use agent::{Agent, AgentBuilder, AgentError, RunOutcome};
 pub use budget::Budget;
@@ -33,4 +36,6 @@ pub use model::{
 pub use policy::{AllowAll, Decision, EffectPolicy, Policy};
 pub use pricing::{Priced, Pricing};
 pub use state::{PendingCall, RunState, Status};
+pub use subagent::AgentTool;
 pub use tool::{Effect, Tool, ToolCtx, ToolError, ToolSpec, tool};
+pub use workflow::{AgentResult, GroupChat, Workflow, WorkflowCtx, WorkflowError, WorkflowOutcome, WorkflowStatus};

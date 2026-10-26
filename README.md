@@ -110,6 +110,26 @@ let agent = Agent::builder("worker")
 
 (Example prices are placeholders — use your providers' current rates.)
 
+### Workflows and multi-agent orchestration
+
+```rust
+let triage = Workflow::new("triage", journal.clone(), |ctx: WorkflowCtx, ticket: String| async move {
+    let facts = ctx.agent("research", &researcher, &ticket).await?.into_text()?;          // durable child run
+    let reviews = ctx.concurrent("review", &[&legal, &tone], &facts).await?;               // in parallel
+    let reply = ctx.handoff("reply", &[&writer, &billing], "writer", &facts, 3).await?;     // agents hand off
+    Ok(reply.text())
+})
+.max_usd(1.00);                                       // children's budgets are capped to what is left
+
+let outcome = triage.run_with_id("ticket-42", ticket).await?;   // after a crash or approval: triage.resume("ticket-42")
+```
+
+Every `ctx.step(..)` / `ctx.agent(..)` result is journaled: `resume` skips finished steps, resumes a
+child agent that was mid-run, and a child waiting for approval suspends the whole workflow
+(`WorkflowStatus::Suspended`) until it is decided. Patterns: `sequential`, `concurrent`, `handoff`,
+`group_chat` (round-robin or manager-selected). Any agent can also be a tool of another with
+`AgentTool::new(agent, "research", "…")`; the child's spend is charged to the parent's budget.
+
 ### MCP tools
 
 ```rust
@@ -182,6 +202,7 @@ Done in 0.1:
 - True token streaming across providers, the agent (`on_delta`) and the gateway
 - Run leases, `run_with_id`, budget hardening, usability-checked fallback, `finish_schema`
 - MCP client (stdio + Streamable HTTP), evals by replay, per-tool timeouts, `compat:` model specs
+- Durable workflows: sequential, concurrent, handoff and group-chat orchestration; agents as tools
 
 Next:
 
@@ -189,8 +210,7 @@ Next:
 - [ ] Parallel execution of read-only tools; tool retries
 - [ ] Context engine: compaction policies, token budgets per section
 - [ ] Per-agent credential brokering for MCP (OAuth)
-- [ ] Sub-agents as tools; OpenTelemetry GenAI spans
-- [ ] Python (PyO3) and TypeScript (napi-rs) bindings over the same core
+- [ ] OpenTelemetry GenAI spans
 
 ## Contributing
 

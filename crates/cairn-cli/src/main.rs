@@ -116,5 +116,17 @@ fn summary(kind: &EventKind) -> String {
         EventKind::RunCompleted { output, .. } => format!("{:?}", truncate(output, 70)),
         EventKind::FinishRejected { step, reason } => format!("step={step} {}", truncate(reason, 80)),
         EventKind::RunFailed { error } => truncate(error, 80),
+        EventKind::WorkflowStarted { workflow, input } => {
+            format!("workflow={workflow} input={}", truncate(&input.to_string(), 60))
+        }
+        EventKind::StepCompleted { step, output, is_error, child_run, cost_usd, .. } => format!(
+            "{step}{}{} cost={} → {}",
+            if *is_error { " ERROR" } else { "" },
+            child_run.as_deref().map(|c| format!(" child={c}")).unwrap_or_default(),
+            cost_usd.map(|c| format!("${c:.6}")).unwrap_or("-".into()),
+            truncate(&output.to_string(), 60)
+        ),
+        EventKind::WorkflowCompleted { output } => truncate(&output.to_string(), 80),
+        EventKind::WorkflowFailed { error } => truncate(error, 80),
     }
 }

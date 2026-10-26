@@ -1,5 +1,6 @@
 use std::future::Future;
 use std::marker::PhantomData;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,6 +9,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+
+use crate::model::Usage;
 
 /// What a tool does to the world. Policies and retry semantics key off this.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -37,12 +40,36 @@ pub struct ToolCtx {
     /// Stable across retries and crash-recovery re-executions of the same
     /// call. Forward it to downstream APIs to get exactly-once effects.
     pub idempotency_key: String,
+    /// USD the calling run may still spend, when it has a USD budget. Tools
+    /// that spend money (e.g. sub-agents) should stay within it.
+    pub remaining_usd: Option<f64>,
+    charged: Arc<Mutex<(Usage, f64)>>,
 }
 
 impl ToolCtx {
     pub fn new(run_id: &str, call_id: &str) -> Self {
         let digest = Sha256::digest(format!("{run_id}:{call_id}").as_bytes());
-        Self { run_id: run_id.to_owned(), call_id: call_id.to_owned(), idempotency_key: hex::encode(&digest[..16]) }
+        Self {
+            run_id: run_id.to_owned(),
+            call_id: call_id.to_owned(),
+            idempotency_key: hex::encode(&digest[..16]),
+            remaining_usd: None,
+            charged: Arc::default(),
+        }
+    }
+
+    /// Report model usage and cost incurred by this tool call (e.g. by a
+    /// sub-agent). It is journaled with the result and counts toward the
+    /// calling run's budget.
+    pub fn charge(&self, usage: Usage, cost_usd: f64) {
+        let mut c = self.charged.lock().unwrap();
+        c.0.add(&usage);
+        c.1 += cost_usd;
+    }
+
+    /// Everything charged so far.
+    pub fn charged(&self) -> (Usage, f64) {
+        *self.charged.lock().unwrap()
     }
 }
 

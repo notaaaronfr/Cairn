@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use crate::budget::Budget;
 use crate::event::{Event, EventKind};
 use crate::journal::{InMemoryJournal, Journal, JournalError};
+use crate::lease::Lease;
 use crate::message::{Content, Message, content_text};
 use futures::StreamExt;
 
@@ -93,24 +94,6 @@ pub struct Agent {
 
 /// Default lease length; renewed every third of it while a run is driven.
 pub const DEFAULT_LEASE_TTL: Duration = Duration::from_secs(60);
-
-/// Holds a run's lease while it is driven and renews it in the background.
-struct Lease {
-    lost: Arc<std::sync::atomic::AtomicBool>,
-    renewer: tokio::task::JoinHandle<()>,
-}
-
-impl Lease {
-    fn lost(&self) -> bool {
-        self.lost.load(std::sync::atomic::Ordering::SeqCst)
-    }
-}
-
-impl Drop for Lease {
-    fn drop(&mut self) {
-        self.renewer.abort();
-    }
-}
 
 /// A required shape for the run's final answer.
 struct FinishSchema {
@@ -217,11 +200,7 @@ impl Agent {
     pub async fn run_with_id(&self, run_id: &str, input: impl Into<String>) -> Result<RunOutcome, AgentError> {
         // The id names a file in the JSONL journal, so it must be a plain name:
         // nothing that could climb out of the directory or trip up a filesystem.
-        let plain = !run_id.is_empty()
-            && run_id.len() <= 128
-            && !run_id.starts_with('.')
-            && run_id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
-        if !plain {
+        if !crate::lease::is_plain_run_id(run_id) {
             return Err(AgentError::Config(format!(
                 "run id `{run_id}` must be 1–128 characters of A–Z, a–z, 0–9, '-', '_' or '.', not starting with '.'"
             )));
@@ -277,36 +256,13 @@ impl Agent {
     }
 
     async fn take_lease(&self, run_id: &str) -> Result<Lease, AgentError> {
-        if let Err(holder) = self.journal.acquire_lease(run_id, &self.worker_id, self.lease_ttl).await? {
-            return Err(AgentError::Leased {
-                run_id: run_id.to_owned(),
-                owner: holder.owner,
-                expires_at: holder.expires_at,
-            });
-        }
-        let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let (journal, owner, ttl, flag, id) =
-            (self.journal.clone(), self.worker_id.clone(), self.lease_ttl, lost.clone(), run_id.to_owned());
-        let renewer = tokio::spawn(async move {
-            let mut tick = tokio::time::interval((ttl / 3).max(Duration::from_millis(10)));
-            tick.tick().await;
-            loop {
-                tick.tick().await;
-                if !matches!(journal.renew_lease(&id, &owner, ttl).await, Ok(true)) {
-                    tracing::warn!(run_id = %id, %owner, "lost run lease");
-                    flag.store(true, std::sync::atomic::Ordering::SeqCst);
-                    return;
-                }
-            }
-        });
-        Ok(Lease { lost, renewer })
+        Lease::acquire(&self.journal, run_id, &self.worker_id, self.lease_ttl).await?.map_err(|holder| {
+            AgentError::Leased { run_id: run_id.to_owned(), owner: holder.owner, expires_at: holder.expires_at }
+        })
     }
 
-    async fn end_lease(&self, run_id: &str, lease: Lease) {
-        drop(lease);
-        if let Err(e) = self.journal.release_lease(run_id, &self.worker_id).await {
-            tracing::warn!(run_id, error = %e, "could not release run lease; it will expire");
-        }
+    async fn end_lease(&self, _run_id: &str, lease: Lease) {
+        lease.release().await;
     }
 
     /// Current state of a run, rebuilt from its journal.
@@ -501,6 +457,8 @@ impl Agent {
                     output: json!({ "error": format!("unknown tool `{}`", call.name) }),
                     is_error: true,
                     duration_ms: 0,
+                    usage: Usage::default(),
+                    cost_usd: None,
                 };
                 self.emit(state, kind).await?;
                 continue;
@@ -527,7 +485,8 @@ impl Agent {
 
     async fn execute(&self, state: &mut RunState, call: &PendingCall) -> Result<(), AgentError> {
         let tool = self.find_tool(&call.name).cloned();
-        let ctx = ToolCtx::new(&state.run_id, &call.id);
+        let mut ctx = ToolCtx::new(&state.run_id, &call.id);
+        ctx.remaining_usd = self.budget.max_usd.map(|max| (max - state.cost_usd).max(0.0));
         let started = Instant::now();
         let (output, is_error) = match tool {
             Some(tool) => {
@@ -551,12 +510,15 @@ impl Agent {
             }
             None => (json!({ "error": format!("unknown tool `{}`", call.name) }), true),
         };
+        let (usage, cost) = ctx.charged();
         let kind = EventKind::ToolCompleted {
             call_id: call.id.clone(),
             tool: call.name.clone(),
             output,
             is_error,
             duration_ms: started.elapsed().as_millis() as u64,
+            usage,
+            cost_usd: (cost > 0.0).then_some(cost),
         };
         self.emit(state, kind).await
     }
@@ -625,6 +587,12 @@ impl AgentBuilder {
     /// Add several tools at once (e.g. all tools from an MCP server).
     pub fn tools<T: Tool + 'static>(mut self, tools: impl IntoIterator<Item = T>) -> Self {
         self.tools.extend(tools.into_iter().map(|t| Arc::new(t) as Arc<dyn Tool>));
+        self
+    }
+
+    /// Lower the USD budget to at most `usd` (keeping a smaller one).
+    pub fn cap_usd(mut self, usd: f64) -> Self {
+        self.budget.max_usd = Some(self.budget.max_usd.map_or(usd, |m| m.min(usd)));
         self
     }
 
