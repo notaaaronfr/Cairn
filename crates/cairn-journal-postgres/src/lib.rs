@@ -127,7 +127,12 @@ impl Journal for PostgresJournal {
     }
 
     /// Leases use the database clock, so worker clock skew does not matter.
-    async fn acquire_lease(&self, run_id: &str, owner: &str, ttl: Duration) -> Result<Result<(), LeaseHolder>, JournalError> {
+    async fn acquire_lease(
+        &self,
+        run_id: &str,
+        owner: &str,
+        ttl: Duration,
+    ) -> Result<Result<(), LeaseHolder>, JournalError> {
         let taken: Option<String> = sqlx::query_scalar(
             r#"
             INSERT INTO cairn_leases (run_id, owner, expires_at)
@@ -189,8 +194,6 @@ impl Journal for PostgresJournal {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(backend)?;
-        rows.into_iter()
-            .map(|v| serde_json::from_value(v).map_err(|e| JournalError::Corrupt(e.to_string())))
-            .collect()
+        rows.into_iter().map(|v| serde_json::from_value(v).map_err(|e| JournalError::Corrupt(e.to_string()))).collect()
     }
 }

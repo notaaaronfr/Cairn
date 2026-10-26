@@ -329,12 +329,22 @@ impl StreamAcc {
                 Block::Tool { id, name, json, .. } => Content::ToolUse {
                     id,
                     name,
-                    input: if json.trim().is_empty() { json!({}) } else { serde_json::from_str(&json).unwrap_or(json!({})) },
+                    input: if json.trim().is_empty() {
+                        json!({})
+                    } else {
+                        serde_json::from_str(&json).unwrap_or(json!({}))
+                    },
                 },
             })
             .collect();
         let response = Self::parse_stop(self.stop_reason.as_deref());
-        Ok(ModelResponse { model: self.model.clone(), content, stop_reason: response, usage: self.usage, ..Default::default() })
+        Ok(ModelResponse {
+            model: self.model.clone(),
+            content,
+            stop_reason: response,
+            usage: self.usage,
+            ..Default::default()
+        })
     }
 
     fn parse_stop(r: Option<&str>) -> StopReason {
@@ -382,8 +392,11 @@ mod tests {
                 effect: Effect::Read,
             }],
             max_tokens: 100,
-            provider_options: [("anthropic".to_owned(), json!({"thinking": {"type": "enabled", "budget_tokens": 1024}}))]
-                .into(),
+            provider_options: [(
+                "anthropic".to_owned(),
+                json!({"thinking": {"type": "enabled", "budget_tokens": 1024}}),
+            )]
+            .into(),
             ..Default::default()
         }
     }
@@ -460,8 +473,7 @@ event: message_stop
 data: {"type":"message_stop"}
 "#;
         let mut acc = StreamAcc::default();
-        let events: Vec<StreamEvent> =
-            sse::parse_text(raw).into_iter().flat_map(|e| acc.step(e).unwrap()).collect();
+        let events: Vec<StreamEvent> = sse::parse_text(raw).into_iter().flat_map(|e| acc.step(e).unwrap()).collect();
         assert_eq!(events[0], StreamEvent::ThinkingDelta("hmm".into()));
         assert!(events.contains(&StreamEvent::TextDelta("Look".into())));
         assert!(events.contains(&StreamEvent::ToolCallStart { index: 0, id: "tu1".into(), name: "get_order".into() }));
@@ -470,14 +482,20 @@ data: {"type":"message_stop"}
         assert_eq!(r.usage.input_tokens, 12);
         assert_eq!(r.usage.output_tokens, 30);
         assert_eq!(r.content[1], Content::Text { text: "Looking".into() });
-        assert_eq!(r.content[2], Content::ToolUse { id: "tu1".into(), name: "get_order".into(), input: json!({"id": 7}) });
+        assert_eq!(
+            r.content[2],
+            Content::ToolUse { id: "tu1".into(), name: "get_order".into(), input: json!({"id": 7}) }
+        );
         assert!(matches!(&r.content[0], Content::Thinking { provider_data: Some(d), .. } if d["signature"] == "sig"));
     }
 
     #[test]
     fn stream_error_event_is_retryable_when_overloaded() {
         let mut acc = StreamAcc::default();
-        let ev = SseEvent { event: Some("error".into()), data: r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#.into() };
+        let ev = SseEvent {
+            event: Some("error".into()),
+            data: r#"{"type":"error","error":{"type":"overloaded_error","message":"busy"}}"#.into(),
+        };
         assert!(acc.step(ev).unwrap_err().retryable());
     }
 }

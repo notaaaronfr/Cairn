@@ -5,9 +5,8 @@ use serde_json::{Map, Value, json};
 
 use crate::{GatewayError, SseRenderer};
 
-const KNOWN: &[&str] = &[
-    "model", "messages", "tools", "max_tokens", "max_completion_tokens", "temperature", "stream", "stream_options",
-];
+const KNOWN: &[&str] =
+    &["model", "messages", "tools", "max_tokens", "max_completion_tokens", "temperature", "stream", "stream_options"];
 const OPENAI_FAMILY: &[&str] = &["openai", "gemini", "openrouter", "ollama"];
 
 pub fn parse_request(body: &Value) -> Result<(String, ModelRequest, bool), GatewayError> {
@@ -66,8 +65,13 @@ pub fn parse_request(body: &Value) -> Result<(String, ModelRequest, bool), Gatew
         .collect();
 
     let max_tokens = body["max_completion_tokens"].as_u64().or(body["max_tokens"].as_u64()).unwrap_or(4096) as u32;
-    let extras: Map<String, Value> =
-        body.as_object().into_iter().flatten().filter(|(k, _)| !KNOWN.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let extras: Map<String, Value> = body
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| !KNOWN.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     let request = ModelRequest {
         system: (!system.is_empty()).then(|| system.join("\n\n")),

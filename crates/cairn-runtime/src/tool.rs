@@ -42,11 +42,7 @@ pub struct ToolCtx {
 impl ToolCtx {
     pub fn new(run_id: &str, call_id: &str) -> Self {
         let digest = Sha256::digest(format!("{run_id}:{call_id}").as_bytes());
-        Self {
-            run_id: run_id.to_owned(),
-            call_id: call_id.to_owned(),
-            idempotency_key: hex::encode(&digest[..16]),
-        }
+        Self { run_id: run_id.to_owned(), call_id: call_id.to_owned(), idempotency_key: hex::encode(&digest[..16]) }
     }
 }
 

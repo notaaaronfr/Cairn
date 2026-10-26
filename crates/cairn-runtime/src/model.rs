@@ -166,9 +166,8 @@ pub trait Model: Send + Sync {
     /// tokens, counting every attempt a composite model might make. Input is
     /// priced at the higher of the input and cache-write rates.
     fn max_call_cost(&self, input_tokens: u64, output_tokens: u64) -> Option<f64> {
-        self.pricing().map(|p| {
-            (input_tokens as f64 * p.input.max(p.cache_write) + output_tokens as f64 * p.output) / 1_000_000.0
-        })
+        self.pricing()
+            .map(|p| (input_tokens as f64 * p.input.max(p.cache_write) + output_tokens as f64 * p.output) / 1_000_000.0)
     }
 
     /// Ids of models (including any inside a composite) that have no
@@ -186,8 +185,15 @@ pub enum StreamEvent {
     /// Signature for the current thinking block (Anthropic).
     ThinkingSignature(String),
     /// A new tool call; `index` counts tool calls within this response.
-    ToolCallStart { index: usize, id: String, name: String },
-    ToolInputDelta { index: usize, partial_json: String },
+    ToolCallStart {
+        index: usize,
+        id: String,
+        name: String,
+    },
+    ToolInputDelta {
+        index: usize,
+        partial_json: String,
+    },
     /// Final event of every successful stream.
     Completed(ModelResponse),
 }
@@ -437,9 +443,10 @@ impl Model for FallbackModel {
             None => self.pricing().map(|p| p.cost(&response.usage)),
         }?;
         let conservative = self.pricing();
-        response.rejected.iter().try_fold(answer, |acc, r| {
-            r.cost_usd.or_else(|| conservative.map(|p| p.cost(&r.usage))).map(|c| acc + c)
-        })
+        response
+            .rejected
+            .iter()
+            .try_fold(answer, |acc, r| r.cost_usd.or_else(|| conservative.map(|p| p.cost(&r.usage))).map(|c| acc + c))
     }
 
     fn unpriced_models(&self) -> Vec<String> {

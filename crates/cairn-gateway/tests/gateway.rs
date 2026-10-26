@@ -182,7 +182,9 @@ async fn streaming_clients_receive_sse() {
     let text = client
         .post(format!("{base}/v1/messages"))
         .header("x-api-key", "ck_b")
-        .json(&json!({"model": "fast", "stream": true, "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]}))
+        .json(
+            &json!({"model": "fast", "stream": true, "max_tokens": 10, "messages": [{"role": "user", "content": "x"}]}),
+        )
         .send()
         .await
         .unwrap()
@@ -301,17 +303,17 @@ async fn true_streaming_across_formats_with_billing() {
     let first = first_text_at.expect("no text delta");
     assert!(first * 3 < total, "first token at {first:?}, total {total:?} — not streaming");
 
-    let events: Vec<Value> = text
-        .lines()
-        .filter_map(|l| l.strip_prefix("data: "))
-        .map(|d| serde_json::from_str(d).unwrap())
-        .collect();
+    let events: Vec<Value> =
+        text.lines().filter_map(|l| l.strip_prefix("data: ")).map(|d| serde_json::from_str(d).unwrap()).collect();
     let types: Vec<&str> = events.iter().map(|e| e["type"].as_str().unwrap()).collect();
     assert_eq!(types.first(), Some(&"message_start"));
     assert_eq!(types.last(), Some(&"message_stop"));
 
-    let text_deltas: Vec<&str> =
-        events.iter().filter(|e| e["delta"]["type"] == "text_delta").map(|e| e["delta"]["text"].as_str().unwrap()).collect();
+    let text_deltas: Vec<&str> = events
+        .iter()
+        .filter(|e| e["delta"]["type"] == "text_delta")
+        .map(|e| e["delta"]["text"].as_str().unwrap())
+        .collect();
     assert_eq!(text_deltas, ["Hel", "lo"]);
 
     let tool_start = events.iter().find(|e| e["content_block"]["type"] == "tool_use").expect("tool block");

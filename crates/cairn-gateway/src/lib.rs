@@ -7,8 +7,8 @@
 //! failover and an audit trail. Either wire format can be served by any
 //! provider: an OpenAI-SDK client can run on Claude and vice versa.
 
-pub mod config;
 mod anthropic_api;
+pub mod config;
 mod openai_api;
 
 use std::collections::HashMap;
@@ -205,7 +205,12 @@ impl Gateway {
 
     /// Authenticate, authorize and budget-check; returns the key name and
     /// the failover chain for `model`.
-    fn authorize(&self, headers: &HeaderMap, model: &str, rec: &mut AuditRecord) -> Result<(String, Vec<String>), GatewayError> {
+    fn authorize(
+        &self,
+        headers: &HeaderMap,
+        model: &str,
+        rec: &mut AuditRecord,
+    ) -> Result<(String, Vec<String>), GatewayError> {
         let key = self.authenticate(headers)?;
         rec.key = key.name.clone();
         let specs = self.resolve(key, model)?;
@@ -215,7 +220,12 @@ impl Gateway {
 
     /// Walk the failover chain, calling `call` on each model until one
     /// succeeds or a non-retryable error occurs.
-    async fn failover<T, F, Fut>(&self, specs: &[String], rec: &mut AuditRecord, call: F) -> Result<(String, T), GatewayError>
+    async fn failover<T, F, Fut>(
+        &self,
+        specs: &[String],
+        rec: &mut AuditRecord,
+        call: F,
+    ) -> Result<(String, T), GatewayError>
     where
         F: Fn(Arc<dyn Model>) -> Fut,
         Fut: std::future::Future<Output = Result<T, ModelError>>,
@@ -264,7 +274,13 @@ impl Gateway {
             .collect();
     }
 
-    async fn complete(&self, headers: &HeaderMap, model: &str, req: &ModelRequest, rec: &mut AuditRecord) -> Result<ModelResponse, GatewayError> {
+    async fn complete(
+        &self,
+        headers: &HeaderMap,
+        model: &str,
+        req: &ModelRequest,
+        rec: &mut AuditRecord,
+    ) -> Result<ModelResponse, GatewayError> {
         let (key, specs) = self.authorize(headers, model, rec)?;
         let (spec, resp) = self.failover(&specs, rec, |m| async move { m.complete(req).await }).await?;
         self.record_success(&key, &spec, &resp, rec);
@@ -273,7 +289,13 @@ impl Gateway {
 
     /// Opens a stream, failing over until the first model accepts. Once
     /// tokens flow to the client the response is committed to that model.
-    async fn open_stream(&self, headers: &HeaderMap, model: &str, req: &ModelRequest, rec: &mut AuditRecord) -> Result<(String, String, ModelStream), GatewayError> {
+    async fn open_stream(
+        &self,
+        headers: &HeaderMap,
+        model: &str,
+        req: &ModelRequest,
+        rec: &mut AuditRecord,
+    ) -> Result<(String, String, ModelStream), GatewayError> {
         let (key, specs) = self.authorize(headers, model, rec)?;
         let (spec, stream) = self.failover(&specs, rec, |m| async move { m.stream(req).await }).await?;
         Ok((key, spec, stream))
@@ -443,11 +465,19 @@ async fn stream_response(
         .into_response()
 }
 
-async fn openai_chat(State(gw): State<Arc<Gateway>>, headers: HeaderMap, axum::Json(body): axum::Json<Value>) -> Response {
+async fn openai_chat(
+    State(gw): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
     handle(gw, &OPENAI, headers, body).await
 }
 
-async fn anthropic_messages(State(gw): State<Arc<Gateway>>, headers: HeaderMap, axum::Json(body): axum::Json<Value>) -> Response {
+async fn anthropic_messages(
+    State(gw): State<Arc<Gateway>>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> Response {
     handle(gw, &ANTHROPIC, headers, body).await
 }
 

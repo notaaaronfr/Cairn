@@ -47,8 +47,13 @@ pub fn parse_request(body: &Value) -> Result<(String, ModelRequest, bool), Gatew
         });
     }
 
-    let extras: Map<String, Value> =
-        body.as_object().into_iter().flatten().filter(|(k, _)| !KNOWN.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let extras: Map<String, Value> = body
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, _)| !KNOWN.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
 
     let request = ModelRequest {
         system,
@@ -72,7 +77,9 @@ fn block(b: &Value) -> Result<Content, GatewayError> {
         "tool_result" => Content::ToolResult {
             tool_use_id: b["tool_use_id"].as_str().unwrap_or_default().to_owned(),
             content: match &b["content"] {
-                Value::Array(parts) => json!(parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join("")),
+                Value::Array(parts) => {
+                    json!(parts.iter().filter_map(|p| p["text"].as_str()).collect::<Vec<_>>().join(""))
+                }
                 other => other.clone(),
             },
             is_error: b["is_error"].as_bool().unwrap_or(false),
@@ -103,7 +110,9 @@ fn blocks(resp: &ModelResponse) -> Vec<Value> {
         .iter()
         .filter_map(|c| match c {
             Content::Text { text } => Some(json!({"type": "text", "text": text})),
-            Content::ToolUse { id, name, input } => Some(json!({"type": "tool_use", "id": id, "name": name, "input": input})),
+            Content::ToolUse { id, name, input } => {
+                Some(json!({"type": "tool_use", "id": id, "name": name, "input": input}))
+            }
             // Only Anthropic-signed reasoning can be handed to Anthropic clients.
             Content::Thinking { text, provider_data: Some(d) } if d["provider"] == "anthropic" => {
                 Some(if d["redacted_data"].is_null() {

@@ -61,7 +61,9 @@ impl OpenAiCompatModel {
     /// provider's earlier in a fallback chain.
     fn own_reasoning<'a>(&self, c: &'a Content) -> Option<&'a str> {
         match c {
-            Content::Thinking { text, provider_data } if provider_data.as_ref().and_then(|d| d["provider"].as_str()) == Some(self.provider.as_str()) => {
+            Content::Thinking { text, provider_data }
+                if provider_data.as_ref().and_then(|d| d["provider"].as_str()) == Some(self.provider.as_str()) =>
+            {
                 Some(text.as_str())
             }
             _ => None,
@@ -158,7 +160,10 @@ impl OpenAiCompatModel {
         let mut content = Vec::new();
         // Kept even when empty: "" is a value such providers expect back.
         if let Some(r) = msg["reasoning_content"].as_str().or_else(|| msg["reasoning"].as_str()) {
-            content.push(Content::Thinking { text: r.to_owned(), provider_data: Some(json!({ "provider": self.provider })) });
+            content.push(Content::Thinking {
+                text: r.to_owned(),
+                provider_data: Some(json!({ "provider": self.provider })),
+            });
         }
         if let Some(t) = msg["content"].as_str().filter(|s| !s.is_empty()) {
             content.push(Content::Text { text: t.to_owned() });
@@ -430,7 +435,11 @@ mod tests {
                 ]),
                 Message {
                     role: Role::User,
-                    content: vec![Content::ToolResult { tool_use_id: "c1".into(), content: json!("ok"), is_error: false }],
+                    content: vec![Content::ToolResult {
+                        tool_use_id: "c1".into(),
+                        content: json!("ok"),
+                        is_error: false,
+                    }],
                 },
             ],
             max_tokens: 50,
@@ -482,8 +491,7 @@ data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":9,"prompt_to
 data: [DONE]
 "#;
         let mut acc = StreamAcc { provider: "openai".into(), ..Default::default() };
-        let events: Vec<StreamEvent> =
-            sse::parse_text(raw).into_iter().flat_map(|e| acc.step(e).unwrap()).collect();
+        let events: Vec<StreamEvent> = sse::parse_text(raw).into_iter().flat_map(|e| acc.step(e).unwrap()).collect();
         assert_eq!(events[0], StreamEvent::TextDelta("Check".into()));
         assert!(events.contains(&StreamEvent::ToolCallStart { index: 1, id: "c2".into(), name: "b".into() }));
         let StreamEvent::Completed(r) = events.last().unwrap() else { panic!("no completion") };

@@ -58,7 +58,8 @@ fn effect_from(annotations: &Value) -> Effect {
 
 /// Model-facing tool names must match `^[a-zA-Z0-9_-]{1,64}$`.
 fn sanitize(name: &str) -> String {
-    let s: String = name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
+    let s: String =
+        name.chars().map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' }).collect();
     s.chars().take(64).collect()
 }
 
@@ -117,11 +118,8 @@ impl Tool for McpTool {
 
     async fn call(&self, input: Value, ctx: &ToolCtx) -> Result<Value, ToolError> {
         let meta = json!({"cairn/run_id": ctx.run_id, "cairn/idempotency_key": ctx.idempotency_key});
-        let result = self
-            .client
-            .call_tool(&self.remote_name, input, meta)
-            .await
-            .map_err(|e| ToolError::new(e.to_string()))?;
+        let result =
+            self.client.call_tool(&self.remote_name, input, meta).await.map_err(|e| ToolError::new(e.to_string()))?;
         let text = result["content"]
             .as_array()
             .into_iter()

@@ -112,9 +112,11 @@ async fn custom_policy_can_deny() {
     let agent = Agent::builder("t")
         .model(model)
         .tool(counting_tool("lookup", Effect::Read, calls.clone()))
-        .policy(|_spec: &ToolSpec, input: &Value| {
-            if input["id"] == 666 { Decision::Deny { reason: "forbidden id".into() } } else { Decision::Allow }
-        })
+        .policy(
+            |_spec: &ToolSpec, input: &Value| {
+                if input["id"] == 666 { Decision::Deny { reason: "forbidden id".into() } } else { Decision::Allow }
+            },
+        )
         .build()
         .unwrap();
 
@@ -125,7 +127,8 @@ async fn custom_policy_can_deny() {
 
 #[tokio::test]
 async fn budget_stops_runaway_loops() {
-    let looping: Vec<_> = (0..10).map(|i| tool_call_response(&[(&format!("c{i}"), "lookup", json!({"id": i}))])).collect();
+    let looping: Vec<_> =
+        (0..10).map(|i| tool_call_response(&[(&format!("c{i}"), "lookup", json!({"id": i}))])).collect();
     let agent = Agent::builder("t")
         .model(ScriptedModel::new(looping))
         .tool(counting_tool("lookup", Effect::Read, Arc::new(AtomicU32::new(0))))
@@ -282,8 +285,10 @@ fn usd_budget_refuses_unpriced_models() {
     assert!(err.to_string().contains("unpriced:model"), "{err}");
 
     // Also when the unpriced model hides inside a fallback chain.
-    let chain = FallbackModel::new(vec![Arc::new(ScriptedModel::new(vec![])), Arc::new(Unpriced(ScriptedModel::new(vec![])))]);
-    let err = Agent::builder("t").model(chain).budget(Budget::default().max_usd(1.0)).build().err().expect("must refuse");
+    let chain =
+        FallbackModel::new(vec![Arc::new(ScriptedModel::new(vec![])), Arc::new(Unpriced(ScriptedModel::new(vec![])))]);
+    let err =
+        Agent::builder("t").model(chain).budget(Budget::default().max_usd(1.0)).build().err().expect("must refuse");
     assert!(err.to_string().contains("unpriced:model"), "{err}");
 
     // Without a USD budget, unpriced models are fine.
@@ -296,7 +301,8 @@ fn usd_budget_refuses_unpriced_models() {
 #[tokio::test]
 async fn usd_budget_actually_stops_the_run() {
     // ScriptedModel: $1/Mtok, 120 tokens per call => $0.00012 per step.
-    let looping: Vec<_> = (0..10).map(|i| tool_call_response(&[(&format!("c{i}"), "lookup", json!({"id": i}))])).collect();
+    let looping: Vec<_> =
+        (0..10).map(|i| tool_call_response(&[(&format!("c{i}"), "lookup", json!({"id": i}))])).collect();
     let agent = Agent::builder("t")
         .model(ScriptedModel::new(looping))
         .tool(counting_tool("lookup", Effect::Read, Arc::new(AtomicU32::new(0))))
@@ -440,14 +446,21 @@ mod usable_fallback {
     async fn bad_or_incomplete_json_falls_back_good_json_is_kept() {
         let fields = ["summary", "work", "risks", "confidence"];
         let partial = text_response(r#"{"summary": "done", "work": "x"}"#);
-        let good = text_response(r#"```json
+        let good = text_response(
+            r#"```json
 {"summary": "s", "work": "w", "risks": ["r"], "confidence": 0.8}
-```"#);
+```"#,
+        );
 
         let (agent, out) =
-            run(FallbackModel::new(vec![k2(vec![partial]), haiku(vec![good.clone()])]).require_json_fields(&fields)).await;
+            run(FallbackModel::new(vec![k2(vec![partial]), haiku(vec![good.clone()])]).require_json_fields(&fields))
+                .await;
         let resp = first_model_call(&agent, &out.run_id).await;
-        assert!(resp.rejected[0].reason.contains("missing required field(s): risks, confidence"), "{:?}", resp.rejected);
+        assert!(
+            resp.rejected[0].reason.contains("missing required field(s): risks, confidence"),
+            "{:?}",
+            resp.rejected
+        );
         assert_eq!(resp.served_by.as_deref(), Some("anthropic:haiku"));
 
         // When K2 gets it right, Haiku is never called.
@@ -459,7 +472,8 @@ mod usable_fallback {
 
     #[tokio::test]
     async fn tool_call_turns_are_not_held_to_the_json_rule() {
-        let k = k2(vec![tool_call_response(&[("c1", "lookup", json!({"id": 1}))]), text_response(r#"{"summary":"s"}"#)]);
+        let k =
+            k2(vec![tool_call_response(&[("c1", "lookup", json!({"id": 1}))]), text_response(r#"{"summary":"s"}"#)]);
         let chain = FallbackModel::new(vec![k, haiku(vec![])]).require_json_fields(&["summary"]);
         let agent = Agent::builder("t")
             .model(chain)
@@ -475,7 +489,10 @@ mod usable_fallback {
         let (k, h) = (k2(vec![text_response("")]), haiku(vec![truncated("abc")]));
         let (agent, out) = run(FallbackModel::new(vec![k, h])).await;
         let Status::Failed { error } = &out.status else { panic!("{:?}", out.status) };
-        assert!(error.contains("k2:K2: reply is empty") && error.contains("anthropic:haiku: reply was cut off"), "{error}");
+        assert!(
+            error.contains("k2:K2: reply is empty") && error.contains("anthropic:haiku: reply was cut off"),
+            "{error}"
+        );
         assert_eq!(out.usage.total(), 240);
         assert!(out.cost_usd > 0.0);
         let state = agent.state(&out.run_id).await.unwrap();
@@ -583,7 +600,10 @@ mod budget_cap {
     #[tokio::test]
     async fn stops_before_calling_when_budget_cannot_buy_minimum() {
         let model = Arc::new(ScriptedModel::new(looping(1)));
-        let out = agent(model.clone(), Budget::default().max_tokens(5_000).min_output_tokens(10_000)).run("go").await.unwrap();
+        let out = agent(model.clone(), Budget::default().max_tokens(5_000).min_output_tokens(10_000))
+            .run("go")
+            .await
+            .unwrap();
         let Status::BudgetExceeded { reason } = &out.status else { panic!("{:?}", out.status) };
         assert!(reason.contains("minimum 10000"), "{reason}");
         assert!(model.requests().is_empty(), "no model call may be made");
@@ -596,7 +616,15 @@ mod budget_cap {
 
         let a = Arc::new(ScriptedModel::new(vec![text_response("a")]));
         let chain = FallbackModel::new(vec![a.clone(), Arc::new(ScriptedModel::new(vec![]))]);
-        Agent::builder("t").model(chain).max_tokens(4096).budget(Budget::default().max_usd(0.001)).build().unwrap().run("go").await.unwrap();
+        Agent::builder("t")
+            .model(chain)
+            .max_tokens(4096)
+            .budget(Budget::default().max_usd(0.001))
+            .build()
+            .unwrap()
+            .run("go")
+            .await
+            .unwrap();
 
         let (one, two) = (single.requests()[0].max_tokens, a.requests()[0].max_tokens);
         assert!(two < one, "a two-model chain must leave room for both attempts: {two} vs {one}");
@@ -616,7 +644,8 @@ mod finish_schema {
         confidence: f64,
     }
 
-    const GOOD: &str = r#"{"summary":"Fixed login","work":"Patched session expiry","risks":["sessions reset once"],"confidence":0.9}"#;
+    const GOOD: &str =
+        r#"{"summary":"Fixed login","work":"Patched session expiry","risks":["sessions reset once"],"confidence":0.9}"#;
 
     fn agent(model: Arc<ScriptedModel>) -> Agent {
         Agent::builder("worker")
@@ -777,10 +806,15 @@ mod evals {
 
         let requests = k2.requests();
         let reads = &requests[1].messages.last().unwrap().content;
-        assert!(matches!(&reads[0], Content::ToolResult { content, .. } if content["title"] == "live task 1"), "recorded result served");
+        assert!(
+            matches!(&reads[0], Content::ToolResult { content, .. } if content["title"] == "live task 1"),
+            "recorded result served"
+        );
         assert!(matches!(&reads[1], Content::ToolResult { content, .. } if content["title"] == "live task 2"));
         let writes = &requests[2].messages.last().unwrap().content;
-        assert!(matches!(&writes[0], Content::ToolResult { content, is_error: false, .. } if content["submitted"] == 1));
+        assert!(
+            matches!(&writes[0], Content::ToolResult { content, is_error: false, .. } if content["submitted"] == 1)
+        );
         assert!(matches!(&writes[1], Content::ToolResult { content, is_error: true, .. }
             if content["error"].as_str().unwrap().contains("not executed")));
 
@@ -803,9 +837,15 @@ mod evals {
         let c = Counters { reads: Arc::default(), writes: Arc::default() };
         let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
         let (prod, run_id) = production(&c, journal.clone()).await;
-        let k2 = Arc::new(ScriptedModel::new(vec![tool_call_response(&[("k1", "get_task", json!({"id": 7}))]), text_response(HANDOFF)]));
+        let k2 = Arc::new(ScriptedModel::new(vec![
+            tool_call_response(&[("k1", "get_task", json!({"id": 7}))]),
+            text_response(HANDOFF),
+        ]));
         let cases = EvalCase::load(journal.as_ref(), &[run_id]).await.unwrap();
-        Evaluator::new(prod.to_builder().model(k2.clone()).build().unwrap()).live_tools(LiveTools::Never).run(&cases).await;
+        Evaluator::new(prod.to_builder().model(k2.clone()).build().unwrap())
+            .live_tools(LiveTools::Never)
+            .run(&cases)
+            .await;
         assert_eq!(c.reads.load(Ordering::SeqCst), 1, "no live read during replay");
     }
 
@@ -835,17 +875,25 @@ mod leases {
                 Ok(json!("ok"))
             }
         });
-        Agent::builder("support").model(ScriptedModel::new(responses)).tool(refund).shared_journal(journal).worker_id(name).build().unwrap()
+        Agent::builder("support")
+            .model(ScriptedModel::new(responses))
+            .tool(refund)
+            .shared_journal(journal)
+            .worker_id(name)
+            .build()
+            .unwrap()
     }
 
     #[tokio::test]
     async fn only_one_worker_drives_a_run() {
         let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
         let refunds = Arc::new(AtomicU32::new(0));
-        let a = worker("a", journal.clone(), refunds.clone(), vec![
-            tool_call_response(&[("r1", "refund", json!({"id": 1}))]),
-            text_response("done"),
-        ]);
+        let a = worker(
+            "a",
+            journal.clone(),
+            refunds.clone(),
+            vec![tool_call_response(&[("r1", "refund", json!({"id": 1}))]), text_response("done")],
+        );
         let b = worker("b", journal.clone(), refunds.clone(), vec![text_response("done")]);
 
         let out = a.run("refund").await.unwrap();
@@ -865,7 +913,12 @@ mod leases {
     async fn crashed_workers_lease_expires_and_another_takes_over() {
         let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
         let refunds = Arc::new(AtomicU32::new(0));
-        let a = worker("a", journal.clone(), refunds.clone(), vec![tool_call_response(&[("r1", "refund", json!({"id": 1}))])]);
+        let a = worker(
+            "a",
+            journal.clone(),
+            refunds.clone(),
+            vec![tool_call_response(&[("r1", "refund", json!({"id": 1}))])],
+        );
         let out = a.run("refund").await.unwrap();
         a.decide(&out.run_id, "r1", true, None, None).await.unwrap();
 
@@ -885,10 +938,12 @@ mod leases {
         let journal: Arc<dyn Journal> = Arc::new(InMemoryJournal::new());
         let refunds = Arc::new(AtomicU32::new(0));
         // 30ms lease, 150ms tool: without renewal the lease would expire mid-call.
-        let a = worker("a", journal.clone(), refunds.clone(), vec![
-            tool_call_response(&[("r1", "refund", json!({"id": 1}))]),
-            text_response("done"),
-        ])
+        let a = worker(
+            "a",
+            journal.clone(),
+            refunds.clone(),
+            vec![tool_call_response(&[("r1", "refund", json!({"id": 1}))]), text_response("done")],
+        )
         .to_builder()
         .lease_ttl(Duration::from_millis(30))
         .build()

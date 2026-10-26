@@ -278,7 +278,11 @@ impl Agent {
 
     async fn take_lease(&self, run_id: &str) -> Result<Lease, AgentError> {
         if let Err(holder) = self.journal.acquire_lease(run_id, &self.worker_id, self.lease_ttl).await? {
-            return Err(AgentError::Leased { run_id: run_id.to_owned(), owner: holder.owner, expires_at: holder.expires_at });
+            return Err(AgentError::Leased {
+                run_id: run_id.to_owned(),
+                owner: holder.owner,
+                expires_at: holder.expires_at,
+            });
         }
         let lost = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (journal, owner, ttl, flag, id) =
