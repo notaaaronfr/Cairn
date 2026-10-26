@@ -20,12 +20,20 @@ cairn-runtime.workspace = true
 cairn-models.workspace = true
 cairn-journal-postgres = { workspace = true, optional = true }
 cairn-ai-mcp = { workspace = true, optional = true }
+opentelemetry = { workspace = true, optional = true }
+opentelemetry_sdk = { workspace = true, optional = true }
+opentelemetry-otlp = { workspace = true, optional = true }
+tracing-opentelemetry = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
 
 [features]
 postgres = ["dep:cairn-journal-postgres"]
 mcp = ["dep:cairn-ai-mcp"]
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry", "dep:tracing-subscriber", "dep:tracing"]
 
 [dev-dependencies]
+axum.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

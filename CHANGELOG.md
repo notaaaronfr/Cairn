@@ -12,6 +12,10 @@ All notable changes to Cairn are documented here. The format follows
 - Multi-agent orchestration: `sequential`, `concurrent`, `handoff` and `group_chat` (round-robin
   or manager-selected).
 - `AgentTool`: use an agent as another agent's tool; the child's spend is charged to the parent.
+- `Middleware`: `before_model`, `after_model`, `before_tool` and `after_tool` hooks to inspect,
+  rewrite or refuse each step; rewrites are what get journaled.
+- OpenTelemetry: `invoke_agent`, `chat` and `execute_tool` spans with GenAI semantic-convention
+  attributes; `cairn::otel::init` exports them over OTLP/HTTP (feature `otel`).
 - `ToolCtx::charge` and `ToolCtx::remaining_usd` for tools that spend money; tool spend is journaled
   on `ToolCompleted` and counts toward budgets.
 

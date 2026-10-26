@@ -34,10 +34,15 @@ pub mod mcp {
     pub use cairn_mcp::*;
 }
 
+/// OpenTelemetry export (enable the `otel` feature).
+#[cfg(feature = "otel")]
+pub mod otel;
+
 pub mod prelude {
     pub use cairn_runtime::{
-        Agent, AllowAll, Budget, Content, Decision, Effect, EffectPolicy, Event, EventKind, FallbackModel,
-        InMemoryJournal, Journal, JsonlJournal, Message, Model, PendingCall, Policy, Priced, Pricing, RunOutcome,
-        RunState, Status, StreamEvent, Tool, ToolCtx, ToolError, ToolSpec, tool,
+        Agent, AgentTool, AllowAll, Budget, Content, Decision, Effect, EffectPolicy, Event, EventKind, FallbackModel,
+        GroupChat, HookCtx, InMemoryJournal, Journal, JsonlJournal, Message, Middleware, Model, PendingCall, Policy,
+        Priced, Pricing, RunOutcome, RunState, Status, StreamEvent, Tool, ToolCtx, ToolError, ToolSpec, Workflow,
+        WorkflowCtx, WorkflowError, WorkflowStatus, tool,
     };
 }
