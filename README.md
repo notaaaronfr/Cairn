@@ -130,6 +130,33 @@ child agent that was mid-run, and a child waiting for approval suspends the whol
 `group_chat` (round-robin or manager-selected). Any agent can also be a tool of another with
 `AgentTool::new(agent, "research", "…")`; the child's spend is charged to the parent's budget.
 
+### Middleware and OpenTelemetry
+
+```rust
+struct Compliance;
+
+#[async_trait]
+impl Middleware for Compliance {
+    async fn before_model(&self, _: &HookCtx, req: &mut ModelRequest) -> Result<(), String> {
+        redact_pii(req); Ok(())                                   // rewrite what the provider sees
+    }
+    async fn before_tool(&self, _: &HookCtx, tool: &ToolSpec, input: &mut Value) -> Result<(), String> {
+        if tool.name == "refund" && input["amount"].as_f64() > Some(1000.0) {
+            return Err("refunds over $1000 need a manager".into());   // denied; the model is told why
+        }
+        Ok(())
+    }
+}
+
+let agent = Agent::builder("billing").model(model).middleware(Compliance).build()?;
+let _otel = cairn::otel::init("http://localhost:4318/v1/traces", "billing-worker")?;   // features = ["otel"]
+```
+
+Hooks: `before_model`, `after_model`, `before_tool`, `after_tool`; what they rewrite is what gets
+journaled. Every run emits `invoke_agent`, `chat` and `execute_tool` spans with OpenTelemetry GenAI
+attributes (`gen_ai.request.model`, `gen_ai.usage.*`, `gen_ai.tool.name`, plus `cairn.cost_usd`), so
+any OTLP backend — Datadog, Grafana, Honeycomb, Jaeger, Azure Monitor — shows them.
+
 ### MCP tools
 
 ```rust
@@ -203,6 +230,7 @@ Done in 0.1:
 - Run leases, `run_with_id`, budget hardening, usability-checked fallback, `finish_schema`
 - MCP client (stdio + Streamable HTTP), evals by replay, per-tool timeouts, `compat:` model specs
 - Durable workflows: sequential, concurrent, handoff and group-chat orchestration; agents as tools
+- Middleware hooks; OpenTelemetry GenAI spans with an OTLP exporter
 
 Next:
 
@@ -210,7 +238,6 @@ Next:
 - [ ] Parallel execution of read-only tools; tool retries
 - [ ] Context engine: compaction policies, token budgets per section
 - [ ] Per-agent credential brokering for MCP (OAuth)
-- [ ] OpenTelemetry GenAI spans
 
 ## Contributing
 

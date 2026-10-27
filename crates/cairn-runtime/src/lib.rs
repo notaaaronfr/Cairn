@@ -14,6 +14,7 @@ pub mod event;
 pub mod journal;
 pub mod lease;
 pub mod message;
+pub mod middleware;
 pub mod model;
 pub mod output;
 pub mod policy;
@@ -29,6 +30,7 @@ pub use budget::Budget;
 pub use event::{Event, EventKind};
 pub use journal::{InMemoryJournal, Journal, JournalError, JsonlJournal, LeaseHolder};
 pub use message::{Content, Message, Role};
+pub use middleware::{HookCtx, Middleware};
 pub use model::{
     FallbackModel, Model, ModelError, ModelRequest, ModelResponse, ModelStream, RejectedAttempt, StopReason,
     StreamEvent, Usage, synthesize_stream,

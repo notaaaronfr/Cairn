@@ -11,7 +11,9 @@ use crate::journal::{InMemoryJournal, Journal, JournalError};
 use crate::lease::Lease;
 use crate::message::{Content, Message, content_text};
 use futures::StreamExt;
+use tracing::Instrument;
 
+use crate::middleware::{HookCtx, Middleware};
 use crate::model::{Model, ModelError, ModelRequest, ModelResponse, StreamEvent, Usage};
 use crate::policy::{Decision, EffectPolicy, Policy};
 use crate::state::{PendingCall, RunState, Status};
@@ -90,6 +92,7 @@ pub struct Agent {
     finish: Option<FinishSchema>,
     worker_id: String,
     lease_ttl: Duration,
+    middleware: Vec<Arc<dyn Middleware>>,
 }
 
 /// Default lease length; renewed every third of it while a run is driven.
@@ -143,6 +146,7 @@ impl Agent {
             finish_retries: 1,
             worker_id: None,
             lease_ttl: DEFAULT_LEASE_TTL,
+            middleware: Vec::new(),
         }
     }
 
@@ -170,6 +174,7 @@ impl Agent {
             finish_retries: self.finish.as_ref().map_or(1, |f| f.retries),
             worker_id: Some(self.worker_id.clone()),
             lease_ttl: self.lease_ttl,
+            middleware: self.middleware.clone(),
         }
     }
 
@@ -240,7 +245,7 @@ impl Agent {
         let lease = self.take_lease(run_id).await?;
         // Load after taking the lease so we see everything the previous holder wrote.
         let result = match self.state(run_id).await {
-            Ok(state) => self.drive(state, &lease).await,
+            Ok(state) => self.drive(state, &lease).instrument(self.run_span(run_id)).await,
             Err(e) => Err(e),
         };
         self.end_lease(run_id, lease).await;
@@ -250,9 +255,21 @@ impl Agent {
     async fn drive_leased(&self, state: RunState) -> Result<RunOutcome, AgentError> {
         let run_id = state.run_id.clone();
         let lease = self.take_lease(&run_id).await?;
-        let result = self.drive(state, &lease).await;
+        let span = self.run_span(&run_id);
+        let result = self.drive(state, &lease).instrument(span).await;
         self.end_lease(&run_id, lease).await;
         result
+    }
+
+    /// `invoke_agent` span (OpenTelemetry GenAI conventions).
+    fn run_span(&self, run_id: &str) -> tracing::Span {
+        tracing::info_span!(
+            "invoke_agent",
+            otel.name = %format!("invoke_agent {}", self.name),
+            gen_ai.operation.name = "invoke_agent",
+            gen_ai.agent.name = %self.name,
+            cairn.run_id = %run_id,
+        )
     }
 
     async fn take_lease(&self, run_id: &str) -> Result<Lease, AgentError> {
@@ -354,15 +371,60 @@ impl Agent {
             Err(reason) => return self.emit(state, EventKind::BudgetExceeded { reason }).await,
         }
         let step = state.steps + 1;
+        let hook = HookCtx { run_id: state.run_id.clone(), agent: self.name.clone(), step };
+        for m in &self.middleware {
+            if let Err(reason) = m.before_model(&hook, &mut request).await {
+                return self
+                    .fail_step(state, step, format!("blocked by middleware before the model call: {reason}"))
+                    .await;
+            }
+        }
+        let model_id = self.model.id();
+        let span = tracing::info_span!(
+            "chat",
+            otel.name = %format!("chat {model_id}"),
+            gen_ai.operation.name = "chat",
+            gen_ai.provider.name = %model_id.split(':').next().unwrap_or_default(),
+            gen_ai.request.model = %model_id,
+            gen_ai.request.max_tokens = request.max_tokens,
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            cairn.cost_usd = tracing::field::Empty,
+            cairn.step = step,
+            error.type = tracing::field::Empty,
+        );
         let started = Instant::now();
 
-        let result = match &self.on_delta {
-            Some(on_delta) => self.stream_turn(&request, on_delta).await,
-            None => self.model.complete(&request).await,
+        let mut result = match &self.on_delta {
+            Some(on_delta) => self.stream_turn(&request, on_delta).instrument(span.clone()).await,
+            None => self.model.complete(&request).instrument(span.clone()).await,
         };
+        if let Ok(response) = &mut result {
+            for m in &self.middleware {
+                if let Err(reason) = m.after_model(&hook, response).await {
+                    span.record("error.type", "middleware");
+                    return self
+                        .fail_step(state, step, format!("blocked by middleware after the model call: {reason}"))
+                        .await;
+                }
+            }
+        }
         match result {
             Ok(response) => {
                 let cost_usd = self.model.cost_usd(&response);
+                let usage = response.total_usage();
+                span.record("gen_ai.response.model", response.model.as_str());
+                span.record("gen_ai.response.finish_reasons", format!("{:?}", response.stop_reason).to_lowercase());
+                span.record(
+                    "gen_ai.usage.input_tokens",
+                    usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
+                );
+                span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+                if let Some(c) = cost_usd {
+                    span.record("cairn.cost_usd", c);
+                }
                 let wants_tools = response.content.iter().any(|c| matches!(c, Content::ToolUse { .. }));
                 let text = content_text(&response.content);
                 let duration_ms = started.elapsed().as_millis() as u64;
@@ -372,6 +434,7 @@ impl Agent {
                 }
             }
             Err(e) => {
+                span.record("error.type", "model_error");
                 let error = e.to_string();
                 let (usage, spent) = e.spent();
                 // Unpriced spend can only happen without a USD budget.
@@ -381,6 +444,13 @@ impl Agent {
             }
         }
         Ok(())
+    }
+
+    /// Fail the run at this step (journaled as ModelFailed + RunFailed).
+    async fn fail_step(&self, state: &mut RunState, step: u32, error: String) -> Result<(), AgentError> {
+        let kind = EventKind::ModelFailed { step, error: error.clone(), usage: Usage::default(), cost_usd: None };
+        self.emit(state, kind).await?;
+        self.emit(state, EventKind::RunFailed { error }).await
     }
 
     /// The configured system prompt, plus — when a finish schema is set —
@@ -488,10 +558,33 @@ impl Agent {
         let mut ctx = ToolCtx::new(&state.run_id, &call.id);
         ctx.remaining_usd = self.budget.max_usd.map(|max| (max - state.cost_usd).max(0.0));
         let started = Instant::now();
-        let (output, is_error) = match tool {
+        let hook = HookCtx { run_id: state.run_id.clone(), agent: self.name.clone(), step: state.steps };
+        let mut input = call.input.clone();
+        if let Some(tool) = &tool {
+            for m in &self.middleware {
+                if let Err(reason) = m.before_tool(&hook, tool.spec(), &mut input).await {
+                    let kind = EventKind::ToolDenied {
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        reason: format!("blocked by middleware: {reason}"),
+                    };
+                    return self.emit(state, kind).await;
+                }
+            }
+        }
+        let span = tracing::info_span!(
+            "execute_tool",
+            otel.name = %format!("execute_tool {}", call.name),
+            gen_ai.operation.name = "execute_tool",
+            gen_ai.tool.name = %call.name,
+            gen_ai.tool.call.id = %call.id,
+            gen_ai.tool.type = "function",
+            error.type = tracing::field::Empty,
+        );
+        let (mut output, mut is_error) = match &tool {
             Some(tool) => {
                 let limit = tool.timeout().or(self.tool_timeout);
-                let fut = tool.call(call.input.clone(), &ctx);
+                let fut = tool.call(input, &ctx).instrument(span.clone());
                 let result = match limit {
                     Some(limit) => tokio::time::timeout(limit, fut).await.unwrap_or_else(|_| {
                         tracing::warn!(tool = %call.name, ?limit, "tool timed out");
@@ -510,6 +603,17 @@ impl Agent {
             }
             None => (json!({ "error": format!("unknown tool `{}`", call.name) }), true),
         };
+        if let Some(tool) = &tool {
+            for m in &self.middleware {
+                if let Err(reason) = m.after_tool(&hook, tool.spec(), &mut output, &mut is_error).await {
+                    output = json!({ "error": format!("blocked by middleware: {reason}") });
+                    is_error = true;
+                }
+            }
+        }
+        if is_error {
+            span.record("error.type", "tool_error");
+        }
         let (usage, cost) = ctx.charged();
         let kind = EventKind::ToolCompleted {
             call_id: call.id.clone(),
@@ -550,6 +654,7 @@ pub struct AgentBuilder {
     finish_retries: u32,
     worker_id: Option<String>,
     lease_ttl: Duration,
+    middleware: Vec<Arc<dyn Middleware>>,
 }
 
 impl AgentBuilder {
@@ -587,6 +692,12 @@ impl AgentBuilder {
     /// Add several tools at once (e.g. all tools from an MCP server).
     pub fn tools<T: Tool + 'static>(mut self, tools: impl IntoIterator<Item = T>) -> Self {
         self.tools.extend(tools.into_iter().map(|t| Arc::new(t) as Arc<dyn Tool>));
+        self
+    }
+
+    /// Add a hook around every model and tool call (run in the order added).
+    pub fn middleware(mut self, m: impl Middleware + 'static) -> Self {
+        self.middleware.push(Arc::new(m));
         self
     }
 
@@ -735,6 +846,7 @@ impl AgentBuilder {
             finish,
             worker_id: self.worker_id.unwrap_or_else(|| format!("worker-{}", uuid::Uuid::now_v7())),
             lease_ttl: self.lease_ttl,
+            middleware: self.middleware,
         })
     }
 }
