@@ -306,7 +306,14 @@ impl Gateway {
             let mut line = serde_json::to_vec(rec).unwrap_or_default();
             line.push(b'\n');
             let mut f = file.lock().await;
-            if let Err(e) = f.write_all(&line).await {
+            // tokio's File finishes writes in the background; flush so the
+            // record is on disk before the request is considered done.
+            if let Err(e) = async {
+                f.write_all(&line).await?;
+                f.flush().await
+            }
+            .await
+            {
                 tracing::error!(error = %e, "failed to write audit record");
             }
         }

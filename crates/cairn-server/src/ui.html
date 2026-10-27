@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cairn Dev UI</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1b1d21; --muted: #6b7079; --line: #e3e4e8;
+    --accent: #2f5bd3; --ok: #1f8a4c; --warn: #b26a00; --bad: #c4352b; --chip: #eef0f4;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115; --panel: #171a20; --ink: #e6e8ec; --muted: #9097a3; --line: #262a33;
+      --accent: #7aa2ff; --ok: #4cc283; --warn: #e3a33b; --bad: #ff6b5e; --chip: #20242c;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .2px; }
+  header .spacer { flex: 1; }
+  input, select, textarea, button { font: inherit; color: inherit; }
+  input, select, textarea { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; }
+  button { background: var(--chip); border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  main { display: grid; grid-template-columns: minmax(260px, 360px) 1fr; min-height: calc(100vh - 53px); }
+  aside { border-right: 1px solid var(--line); background: var(--panel); overflow: auto; }
+  .tabs { display: flex; border-bottom: 1px solid var(--line); }
+  .tabs button { flex: 1; border: 0; border-radius: 0; background: transparent; padding: 10px; color: var(--muted); }
+  .tabs button.on { color: var(--ink); box-shadow: inset 0 -2px var(--accent); }
+  .item { padding: 10px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .item:hover, .item.on { background: var(--chip); }
+  .row { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+  .muted { color: var(--muted); }
+  .mono { font-family: var(--mono); font-size: 12.5px; }
+  .pill { font-size: 11.5px; padding: 1px 8px; border-radius: 99px; background: var(--chip); white-space: nowrap; }
+  .pill.completed { color: var(--ok); } .pill.failed, .pill.budget_exceeded { color: var(--bad); } .pill.canceled { color: var(--muted); }
+  .pill.awaiting_approval { color: var(--warn); } .pill.running { color: var(--accent); }
+  section { padding: 16px 20px; overflow: auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin: 12px 0; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; }
+  .card .k { font-size: 12px; color: var(--muted); } .card .v { font-size: 18px; font-variant-numeric: tabular-nums; }
+  .box { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin: 12px 0; }
+  .box h3 { margin: 0 0 8px; font-size: 13px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .4px; }
+  table { width: 100%; border-collapse: collapse; }
+  td { padding: 6px 8px; border-top: 1px solid var(--line); vertical-align: top; }
+  td.nowrap { white-space: nowrap; }
+  td:last-child { overflow-wrap: anywhere; }
+  tr.ev { cursor: pointer; } tr.ev:hover, tr.ev.on { background: var(--chip); }
+  pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-family: var(--mono); font-size: 12.5px; }
+  .msg { border-left: 3px solid var(--line); padding: 4px 10px; margin: 6px 0; }
+  .msg.user { border-color: var(--accent); } .msg.assistant { border-color: var(--ok); }
+  .empty { padding: 40px; text-align: center; color: var(--muted); }
+  .err { color: var(--bad); }
+  form.start { display: grid; gap: 8px; }
+  html, body { overflow-x: hidden; }
+  #key { width: 220px; max-width: 45vw; min-width: 0; }
+  section, aside { min-width: 0; }
+  .scroll { overflow-x: auto; }
+  .item .row > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  @media (max-width: 760px) {
+    main { grid-template-columns: minmax(0, 1fr); }
+    aside { max-height: 40vh; border-right: 0; border-bottom: 1px solid var(--line); }
+    section { padding: 12px 16px; }
+    td.t-time { display: none; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Cairn</h1><span class="muted">Dev UI</span>
+  <span class="spacer"></span>
+  <input id="key" type="password" placeholder="API key (if required)" size="22" aria-label="API key">
+</header>
+<main>
+  <aside>
+    <div class="tabs">
+      <button id="tab-runs" class="on">Runs</button>
+      <button id="tab-approvals">Approvals</button>
+      <button id="tab-start">Start</button>
+    </div>
+    <div id="list"></div>
+  </aside>
+  <section id="detail"><div class="empty">Select a run to see its timeline.</div></section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+function el(tag, attrs, ...children) {
+  const n = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k === "class") n.className = v;
+    else if (k.startsWith("on")) n.addEventListener(k.slice(2), v);
+    else n.setAttribute(k, v);
+  }
+  for (const c of children.flat()) if (c != null) n.append(c instanceof Node ? c : String(c));
+  return n;
+}
+const store = {
+  get(k) { try { return localStorage.getItem(k) || ""; } catch { return ""; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch {} },
+};
+$("key").value = store.get("cairn.key");
+$("key").addEventListener("change", () => { store.set("cairn.key", $("key").value); refresh(); });
+
+async function api(path, opts = {}) {
+  const headers = { "content-type": "application/json" };
+  if ($("key").value) headers.authorization = "Bearer " + $("key").value;
+  const r = await fetch(path, { ...opts, headers });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error || r.statusText);
+  return body;
+}
+const money = (x) => "$" + (x || 0).toFixed(x >= 1 ? 2 : 6);
+const ago = (t) => { if (!t) return ""; const s = (Date.now() - new Date(t)) / 1000;
+  return s < 60 ? Math.round(s) + "s ago" : s < 3600 ? Math.round(s / 60) + "m ago" : s < 86400 ? Math.round(s / 3600) + "h ago" : new Date(t).toLocaleDateString(); };
+
+let tab = "runs", selected = null, selectedSeq = null;
+for (const t of ["runs", "approvals", "start"]) $("tab-" + t).onclick = () => { tab = t;
+  document.querySelectorAll(".tabs button").forEach((b) => b.classList.toggle("on", b.id === "tab-" + t)); refresh(); };
+
+async function refresh() {
+  const list = $("list");
+  try {
+    if (tab === "runs") {
+      const runs = await api("/v1/runs?limit=100");
+      list.replaceChildren(...(runs.length ? runs.map((r) => el("div", { class: "item" + (r.run_id === selected ? " on" : ""), onclick: () => select(r.run_id) },
+        el("div", { class: "row" }, el("strong", {}, r.agent), el("span", { class: "pill " + r.status }, r.status.replaceAll("_", " "))),
+        el("div", { class: "row muted" }, el("span", { class: "mono" }, r.run_id.slice(0, 22)), el("span", {}, money(r.cost_usd) + " · " + ago(r.updated_at))),
+      )) : [el("div", { class: "empty" }, "No runs yet.")]));
+    } else if (tab === "approvals") {
+      const pending = await api("/v1/approvals");
+      list.replaceChildren(...(pending.length ? pending.map((p) => el("div", { class: "item", onclick: () => select(p.run_id) },
+        el("div", { class: "row" }, el("strong", {}, p.tool), el("span", { class: "pill awaiting_approval" }, p.agent)),
+        el("pre", { class: "muted" }, JSON.stringify(p.input)),
+      )) : [el("div", { class: "empty" }, "Nothing waiting for approval.")]));
+    } else {
+      const agents = await api("/v1/agents");
+      const agentSel = el("select", { "aria-label": "Agent" }, agents.map((a) => el("option", { value: a.name }, a.name)));
+      const input = el("textarea", { rows: 6, placeholder: "Task for the agent" });
+      const id = el("input", { placeholder: "Run id (optional)" });
+      const note = el("div", { class: "muted" });
+      list.replaceChildren(agents.length ? el("form", { class: "start item", onsubmit: async (e) => { e.preventDefault();
+        try { const r = await api(`/v1/agents/${encodeURIComponent(agentSel.value)}/runs`, { method: "POST",
+          body: JSON.stringify({ input: input.value, run_id: id.value || undefined }) });
+          tab = "runs"; $("tab-runs").click(); select(r.run_id); } catch (err) { note.textContent = err.message; note.className = "err"; } } },
+        agentSel, input, id, el("button", { class: "primary", type: "submit" }, "Start run"), note)
+        : el("div", { class: "empty" }, "No agents are hosted here (read-only mode)."));
+      return;
+    }
+  } catch (e) { list.replaceChildren(el("div", { class: "empty err" }, e.message)); }
+  if (selected) render(selected, false);
+}
+
+function select(id) {
+  selected = id; selectedSeq = null;
+  try { history.replaceState(null, "", "#run=" + encodeURIComponent(id)); } catch {}
+  render(id, true); refresh();
+}
+
+function summary(ev) {
+  const k = ev.kind;
+  switch (k.type) {
+    case "run_started": return "input: " + (k.input.content.find((c) => c.type === "text") || {}).text;
+    case "user_message": return "input: " + (k.message.content.find((c) => c.type === "text") || {}).text;
+    case "model_called": return k.response.content.map((c) => c.type === "text" ? JSON.stringify(c.text.slice(0, 80)) : c.type === "tool_use" ? "call " + c.name : c.type).join(", ")
+      + ` · ${k.response.usage.input_tokens + k.response.usage.output_tokens} tok` + (k.cost_usd != null ? " · " + money(k.cost_usd) : "") + ` · ${k.duration_ms}ms`;
+    case "tool_completed": return `${k.tool}${k.is_error ? " ERROR" : ""} → ` + JSON.stringify(k.output).slice(0, 100);
+    case "approval_requested": return `${k.tool} ${JSON.stringify(k.input)} — ${k.reason}`;
+    case "approval_decided": return (k.approved ? "approved" : "rejected") + (k.by ? " by " + k.by : "");
+    case "tool_denied": return `${k.tool}: ${k.reason}`;
+    case "step_completed": return k.step + (k.child_run ? " (child " + k.child_run + ")" : "") + (k.is_error ? " ERROR" : "");
+    case "run_completed": case "workflow_completed": return JSON.stringify(k.output).slice(0, 120);
+    default: return k.reason || k.error || "";
+  }
+}
+
+async function render(id, scrollTop) {
+  const d = $("detail");
+  try {
+    const [run, events] = await Promise.all([api(`/v1/runs/${encodeURIComponent(id)}`), api(`/v1/runs/${encodeURIComponent(id)}/events`)]);
+    if (selected !== id) return;
+    const s = run.summary;
+    const approvals = s.awaiting_approval.length ? el("div", { class: "box" }, el("h3", {}, "Waiting for approval"),
+      s.awaiting_approval.map((c) => el("div", { class: "row", style: "margin:6px 0" },
+        el("pre", {}, `${c.name} ${JSON.stringify(c.input)}`),
+        run.hosted ? el("span", {}, el("button", { class: "primary", onclick: () => decide(id, c.id, true) }, "Approve"), " ",
+          el("button", { class: "danger", onclick: () => decide(id, c.id, false) }, "Reject")) : el("span", { class: "muted" }, "agent not hosted here")))) : null;
+    const rows = events.map((ev) => el("tr", { class: "ev" + (ev.seq === selectedSeq ? " on" : ""), onclick: () => { selectedSeq = ev.seq; render(id, false); } },
+      el("td", { class: "mono muted" }, ev.seq), el("td", { class: "mono muted nowrap t-time" }, new Date(ev.at).toLocaleTimeString()),
+      el("td", { class: "mono nowrap" }, ev.kind.type), el("td", {}, summary(ev))));
+    const stateBox = el("div", { class: "box" }, el("h3", {}, selectedSeq == null ? "Current state" : `State after event ${selectedSeq}`), el("div", { class: "muted" }, "Loading…"));
+    d.replaceChildren(...[
+      el("div", { class: "row" }, el("h2", { style: "margin:0" }, s.agent), el("span", { class: "pill " + s.status }, s.status.replaceAll("_", " "))),
+      el("div", { class: "mono muted" }, s.run_id),
+      el("div", { class: "cards" }, [["Steps", s.steps], ["Tokens", s.tokens.toLocaleString()], ["Cost", money(s.cost_usd)], ["Events", events.length]]
+        .map(([k, v]) => el("div", { class: "card" }, el("div", { class: "k" }, k), el("div", { class: "v" }, v)))),
+      s.output != null ? el("div", { class: "box" }, el("h3", {}, "Output"), el("pre", {}, s.output)) : null,
+      s.error ? el("div", { class: "box" }, el("h3", {}, "Error"), el("pre", { class: "err" }, s.error)) : null,
+      approvals,
+      el("div", { class: "box" }, el("h3", {}, "Timeline — click an event to see the state at that point"), el("div", { class: "scroll" }, el("table", {}, el("tbody", {}, rows)))),
+      stateBox,
+    ].filter((n) => n != null));
+    if (scrollTop) d.scrollTop = 0;
+    const state = await api(`/v1/runs/${encodeURIComponent(id)}/state` + (selectedSeq == null ? "" : `?at=${selectedSeq}`));
+    stateBox.replaceChildren(stateBox.firstChild,
+      ...state.messages.map((m) => el("div", { class: "msg " + m.role }, el("div", { class: "muted" }, m.role),
+        m.content.map((c) => el("pre", {}, c.type === "text" ? c.text : c.type === "tool_use" ? `→ ${c.name} ${JSON.stringify(c.input)}`
+          : c.type === "tool_result" ? `← ${JSON.stringify(c.content)}` : `[${c.type}] ${c.text || ""}`)))),
+      el("details", {}, el("summary", { class: "muted" }, "Raw state"), el("pre", {}, JSON.stringify(state, null, 2))));
+  } catch (e) { d.replaceChildren(el("div", { class: "empty err" }, e.message)); }
+}
+
+async function decide(id, call, approved) {
+  try { await api(`/v1/runs/${encodeURIComponent(id)}/approvals/${encodeURIComponent(call)}`, { method: "POST",
+    body: JSON.stringify({ approved, by: "dev-ui" }) }); } catch (e) { alert(e.message); }
+  setTimeout(() => render(id, false), 300);
+}
+
+const linked = new URLSearchParams(location.hash.slice(1)).get("run");
+if (linked) select(linked); else refresh();
+setInterval(() => { if (tab !== "start") refresh(); }, 3000);
+</script>
+</body>
+</html>

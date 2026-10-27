@@ -6,12 +6,15 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::budget::Budget;
+use crate::context::ContextPolicy;
 use crate::event::{Event, EventKind};
 use crate::journal::{InMemoryJournal, Journal, JournalError};
 use crate::lease::Lease;
 use crate::message::{Content, Message, content_text};
 use futures::StreamExt;
+use tracing::Instrument;
 
+use crate::middleware::{HookCtx, Middleware};
 use crate::model::{Model, ModelError, ModelRequest, ModelResponse, StreamEvent, Usage};
 use crate::policy::{Decision, EffectPolicy, Policy};
 use crate::state::{PendingCall, RunState, Status};
@@ -33,6 +36,8 @@ pub enum AgentError {
     Leased { run_id: String, owner: String, expires_at: chrono::DateTime<chrono::Utc> },
     #[error("lost the lease on run `{run_id}`; another worker may have taken over")]
     LeaseLost { run_id: String },
+    #[error("run `{0}` has not finished; only a finished run can take a follow-up message")]
+    NotFinished(String),
 }
 
 /// Result of driving a run until it finishes or needs a human.
@@ -90,6 +95,8 @@ pub struct Agent {
     finish: Option<FinishSchema>,
     worker_id: String,
     lease_ttl: Duration,
+    middleware: Vec<Arc<dyn Middleware>>,
+    context: ContextPolicy,
 }
 
 /// Default lease length; renewed every third of it while a run is driven.
@@ -143,6 +150,8 @@ impl Agent {
             finish_retries: 1,
             worker_id: None,
             lease_ttl: DEFAULT_LEASE_TTL,
+            middleware: Vec::new(),
+            context: ContextPolicy::default(),
         }
     }
 
@@ -170,6 +179,8 @@ impl Agent {
             finish_retries: self.finish.as_ref().map_or(1, |f| f.retries),
             worker_id: Some(self.worker_id.clone()),
             lease_ttl: self.lease_ttl,
+            middleware: self.middleware.clone(),
+            context: self.context.clone(),
         }
     }
 
@@ -240,9 +251,62 @@ impl Agent {
         let lease = self.take_lease(run_id).await?;
         // Load after taking the lease so we see everything the previous holder wrote.
         let result = match self.state(run_id).await {
-            Ok(state) => self.drive(state, &lease).await,
+            Ok(state) => self.drive(state, &lease).instrument(self.run_span(run_id)).await,
             Err(e) => Err(e),
         };
+        self.end_lease(run_id, lease).await;
+        result
+    }
+
+    /// Continue a finished run with a follow-up user message and drive it:
+    /// a multi-turn conversation on one durable run. The model sees the
+    /// whole history (subject to the agent's [`ContextPolicy`]), and the
+    /// run's budget covers every turn.
+    ///
+    /// Fails with [`AgentError::NotFinished`] while the run is still running
+    /// or awaiting approval.
+    pub async fn continue_run(&self, run_id: &str, input: impl Into<String>) -> Result<RunOutcome, AgentError> {
+        self.continue_message(run_id, Message::user(input)).await
+    }
+
+    pub async fn continue_message(&self, run_id: &str, input: Message) -> Result<RunOutcome, AgentError> {
+        let lease = self.take_lease(run_id).await?;
+        let result = async {
+            let mut state = self.state(run_id).await?;
+            if state.agent != self.name {
+                return Err(AgentError::Config(format!(
+                    "run `{run_id}` belongs to `{}`, not agent `{}`",
+                    state.agent, self.name
+                )));
+            }
+            if !state.status.is_terminal() {
+                return Err(AgentError::NotFinished(run_id.to_owned()));
+            }
+            self.emit(&mut state, EventKind::UserMessage { message: input }).await?;
+            self.drive(state, &lease).await
+        }
+        .instrument(self.run_span(run_id))
+        .await;
+        self.end_lease(run_id, lease).await;
+        result
+    }
+
+    /// Stop a run that is not being driven right now (e.g. one awaiting
+    /// approval, or one whose worker died). Fails with [`AgentError::Leased`]
+    /// while a worker is driving it, and with [`AgentError::Config`] if the
+    /// run has already finished.
+    pub async fn cancel(&self, run_id: &str, reason: &str, by: Option<&str>) -> Result<RunOutcome, AgentError> {
+        let lease = self.take_lease(run_id).await?;
+        let result = async {
+            let mut state = self.state(run_id).await?;
+            if state.status.is_terminal() {
+                return Err(AgentError::Config(format!("run `{run_id}` has already finished")));
+            }
+            let kind = EventKind::RunCanceled { reason: reason.to_owned(), by: by.map(str::to_owned) };
+            self.emit(&mut state, kind).await?;
+            Ok(RunOutcome::from_state(&state))
+        }
+        .await;
         self.end_lease(run_id, lease).await;
         result
     }
@@ -250,9 +314,21 @@ impl Agent {
     async fn drive_leased(&self, state: RunState) -> Result<RunOutcome, AgentError> {
         let run_id = state.run_id.clone();
         let lease = self.take_lease(&run_id).await?;
-        let result = self.drive(state, &lease).await;
+        let span = self.run_span(&run_id);
+        let result = self.drive(state, &lease).instrument(span).await;
         self.end_lease(&run_id, lease).await;
         result
+    }
+
+    /// `invoke_agent` span (OpenTelemetry GenAI conventions).
+    fn run_span(&self, run_id: &str) -> tracing::Span {
+        tracing::info_span!(
+            "invoke_agent",
+            otel.name = %format!("invoke_agent {}", self.name),
+            gen_ai.operation.name = "invoke_agent",
+            gen_ai.agent.name = %self.name,
+            cairn.run_id = %run_id,
+        )
     }
 
     async fn take_lease(&self, run_id: &str) -> Result<Lease, AgentError> {
@@ -335,7 +411,7 @@ impl Agent {
         }
     }
 
-    async fn model_turn(&self, state: &mut RunState) -> Result<(), AgentError> {
+    fn build_request(&self, state: &RunState) -> ModelRequest {
         let mut request = ModelRequest {
             system: self.system_prompt(),
             messages: state.messages.clone(),
@@ -344,6 +420,54 @@ impl Agent {
             temperature: self.temperature,
             provider_options: self.provider_options.clone(),
         };
+        self.context.trim(&mut request);
+        request
+    }
+
+    /// Replace older turns with a journaled summary if the request is too
+    /// large. Returns `Ok(false)` when the run must stop (budget).
+    async fn compact_if_needed(&self, state: &mut RunState, request: &ModelRequest) -> Result<bool, AgentError> {
+        if !self.context.should_compact(estimate_input_tokens(request)) {
+            return Ok(true);
+        }
+        let Some(cut) = self.context.compaction_cut(&state.messages) else {
+            tracing::warn!(run_id = %state.run_id, "context is over the compaction threshold but nothing can be compacted");
+            return Ok(true);
+        };
+        let model: &dyn Model = match self.context.summarizer() {
+            Some(m) => m.as_ref(),
+            None => self.model.as_ref(),
+        };
+        let older = &state.messages[1..1 + cut];
+        let est = serde_json::to_string(older).map_or(0, |s| s.len() as u64).div_ceil(3);
+        let max_tokens = match self
+            .budget
+            .output_cap(2048, state.usage.total(), state.cost_usd, est, |i, o| model.max_call_cost(i, o))
+        {
+            Ok(cap) => cap,
+            Err(reason) => {
+                self.emit(state, EventKind::BudgetExceeded { reason }).await?;
+                return Ok(false);
+            }
+        };
+        match crate::context::summarize(model, older, max_tokens).await {
+            Ok((summary, usage, cost_usd)) => {
+                let kind = EventKind::ContextCompacted { replaced: cut, summary, usage, cost_usd };
+                self.emit(state, kind).await?;
+            }
+            Err(e) => tracing::warn!(run_id = %state.run_id, error = %e, "context compaction failed; continuing"),
+        }
+        Ok(true)
+    }
+
+    async fn model_turn(&self, state: &mut RunState) -> Result<(), AgentError> {
+        let mut request = self.build_request(state);
+        if !self.compact_if_needed(state, &request).await? {
+            return Ok(());
+        }
+        if state.messages.len() != request.messages.len() {
+            request = self.build_request(state);
+        }
         // Shrink this step's answer limit to what the remaining budget can
         // pay for, so one call cannot overshoot it.
         let est_input = estimate_input_tokens(&request);
@@ -354,15 +478,60 @@ impl Agent {
             Err(reason) => return self.emit(state, EventKind::BudgetExceeded { reason }).await,
         }
         let step = state.steps + 1;
+        let hook = HookCtx { run_id: state.run_id.clone(), agent: self.name.clone(), step };
+        for m in &self.middleware {
+            if let Err(reason) = m.before_model(&hook, &mut request).await {
+                return self
+                    .fail_step(state, step, format!("blocked by middleware before the model call: {reason}"))
+                    .await;
+            }
+        }
+        let model_id = self.model.id();
+        let span = tracing::info_span!(
+            "chat",
+            otel.name = %format!("chat {model_id}"),
+            gen_ai.operation.name = "chat",
+            gen_ai.provider.name = %model_id.split(':').next().unwrap_or_default(),
+            gen_ai.request.model = %model_id,
+            gen_ai.request.max_tokens = request.max_tokens,
+            gen_ai.response.model = tracing::field::Empty,
+            gen_ai.response.finish_reasons = tracing::field::Empty,
+            gen_ai.usage.input_tokens = tracing::field::Empty,
+            gen_ai.usage.output_tokens = tracing::field::Empty,
+            cairn.cost_usd = tracing::field::Empty,
+            cairn.step = step,
+            error.type = tracing::field::Empty,
+        );
         let started = Instant::now();
 
-        let result = match &self.on_delta {
-            Some(on_delta) => self.stream_turn(&request, on_delta).await,
-            None => self.model.complete(&request).await,
+        let mut result = match &self.on_delta {
+            Some(on_delta) => self.stream_turn(&request, on_delta).instrument(span.clone()).await,
+            None => self.model.complete(&request).instrument(span.clone()).await,
         };
+        if let Ok(response) = &mut result {
+            for m in &self.middleware {
+                if let Err(reason) = m.after_model(&hook, response).await {
+                    span.record("error.type", "middleware");
+                    return self
+                        .fail_step(state, step, format!("blocked by middleware after the model call: {reason}"))
+                        .await;
+                }
+            }
+        }
         match result {
             Ok(response) => {
                 let cost_usd = self.model.cost_usd(&response);
+                let usage = response.total_usage();
+                span.record("gen_ai.response.model", response.model.as_str());
+                span.record("gen_ai.response.finish_reasons", format!("{:?}", response.stop_reason).to_lowercase());
+                span.record(
+                    "gen_ai.usage.input_tokens",
+                    usage.input_tokens + usage.cache_read_tokens + usage.cache_write_tokens,
+                );
+                span.record("gen_ai.usage.output_tokens", usage.output_tokens);
+                if let Some(c) = cost_usd {
+                    span.record("cairn.cost_usd", c);
+                }
                 let wants_tools = response.content.iter().any(|c| matches!(c, Content::ToolUse { .. }));
                 let text = content_text(&response.content);
                 let duration_ms = started.elapsed().as_millis() as u64;
@@ -372,6 +541,7 @@ impl Agent {
                 }
             }
             Err(e) => {
+                span.record("error.type", "model_error");
                 let error = e.to_string();
                 let (usage, spent) = e.spent();
                 // Unpriced spend can only happen without a USD budget.
@@ -381,6 +551,13 @@ impl Agent {
             }
         }
         Ok(())
+    }
+
+    /// Fail the run at this step (journaled as ModelFailed + RunFailed).
+    async fn fail_step(&self, state: &mut RunState, step: u32, error: String) -> Result<(), AgentError> {
+        let kind = EventKind::ModelFailed { step, error: error.clone(), usage: Usage::default(), cost_usd: None };
+        self.emit(state, kind).await?;
+        self.emit(state, EventKind::RunFailed { error }).await
     }
 
     /// The configured system prompt, plus — when a finish schema is set —
@@ -488,10 +665,33 @@ impl Agent {
         let mut ctx = ToolCtx::new(&state.run_id, &call.id);
         ctx.remaining_usd = self.budget.max_usd.map(|max| (max - state.cost_usd).max(0.0));
         let started = Instant::now();
-        let (output, is_error) = match tool {
+        let hook = HookCtx { run_id: state.run_id.clone(), agent: self.name.clone(), step: state.steps };
+        let mut input = call.input.clone();
+        if let Some(tool) = &tool {
+            for m in &self.middleware {
+                if let Err(reason) = m.before_tool(&hook, tool.spec(), &mut input).await {
+                    let kind = EventKind::ToolDenied {
+                        call_id: call.id.clone(),
+                        tool: call.name.clone(),
+                        reason: format!("blocked by middleware: {reason}"),
+                    };
+                    return self.emit(state, kind).await;
+                }
+            }
+        }
+        let span = tracing::info_span!(
+            "execute_tool",
+            otel.name = %format!("execute_tool {}", call.name),
+            gen_ai.operation.name = "execute_tool",
+            gen_ai.tool.name = %call.name,
+            gen_ai.tool.call.id = %call.id,
+            gen_ai.tool.type = "function",
+            error.type = tracing::field::Empty,
+        );
+        let (mut output, mut is_error) = match &tool {
             Some(tool) => {
                 let limit = tool.timeout().or(self.tool_timeout);
-                let fut = tool.call(call.input.clone(), &ctx);
+                let fut = tool.call(input, &ctx).instrument(span.clone());
                 let result = match limit {
                     Some(limit) => tokio::time::timeout(limit, fut).await.unwrap_or_else(|_| {
                         tracing::warn!(tool = %call.name, ?limit, "tool timed out");
@@ -510,6 +710,17 @@ impl Agent {
             }
             None => (json!({ "error": format!("unknown tool `{}`", call.name) }), true),
         };
+        if let Some(tool) = &tool {
+            for m in &self.middleware {
+                if let Err(reason) = m.after_tool(&hook, tool.spec(), &mut output, &mut is_error).await {
+                    output = json!({ "error": format!("blocked by middleware: {reason}") });
+                    is_error = true;
+                }
+            }
+        }
+        if is_error {
+            span.record("error.type", "tool_error");
+        }
         let (usage, cost) = ctx.charged();
         let kind = EventKind::ToolCompleted {
             call_id: call.id.clone(),
@@ -550,6 +761,8 @@ pub struct AgentBuilder {
     finish_retries: u32,
     worker_id: Option<String>,
     lease_ttl: Duration,
+    middleware: Vec<Arc<dyn Middleware>>,
+    context: ContextPolicy,
 }
 
 impl AgentBuilder {
@@ -587,6 +800,19 @@ impl AgentBuilder {
     /// Add several tools at once (e.g. all tools from an MCP server).
     pub fn tools<T: Tool + 'static>(mut self, tools: impl IntoIterator<Item = T>) -> Self {
         self.tools.extend(tools.into_iter().map(|t| Arc::new(t) as Arc<dyn Tool>));
+        self
+    }
+
+    /// How long runs stay within the context window: trimming of old tool
+    /// results and journaled compaction of older turns.
+    pub fn context(mut self, policy: ContextPolicy) -> Self {
+        self.context = policy;
+        self
+    }
+
+    /// Add a hook around every model and tool call (run in the order added).
+    pub fn middleware(mut self, m: impl Middleware + 'static) -> Self {
+        self.middleware.push(Arc::new(m));
         self
     }
 
@@ -695,7 +921,10 @@ impl AgentBuilder {
     pub fn build(self) -> Result<Agent, AgentError> {
         let model = self.model.ok_or_else(|| AgentError::Config("a model is required".into()))?;
         if self.budget.max_usd.is_some() {
-            let unpriced = model.unpriced_models();
+            let mut unpriced = model.unpriced_models();
+            if let Some(summarizer) = self.context.summarizer() {
+                unpriced.extend(summarizer.unpriced_models());
+            }
             if !unpriced.is_empty() {
                 return Err(AgentError::Config(format!(
                     "max_usd is set but these models have no pricing, so spend could not be counted: {}. \
@@ -735,6 +964,8 @@ impl AgentBuilder {
             finish,
             worker_id: self.worker_id.unwrap_or_else(|| format!("worker-{}", uuid::Uuid::now_v7())),
             lease_ttl: self.lease_ttl,
+            middleware: self.middleware,
+            context: self.context,
         })
     }
 }

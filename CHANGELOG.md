@@ -4,7 +4,13 @@ All notable changes to Cairn are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project uses
 [Semantic Versioning](https://semver.org/). Before 1.0, minor versions may contain breaking changes.
 
-## [Unreleased]
+## [Unreleased] — 0.2.0
+
+### Changed
+- `Status` has a new `Canceled` variant and `AgentError` a new `NotFinished` variant; exhaustive
+  matches on either need a new arm.
+- `gemini:` model specs now use the native Gemini API instead of its OpenAI-compatible endpoint,
+  so thought signatures survive multi-step tool use. `OpenAiCompatModel::gemini` remains available.
 
 ### Added
 - Durable workflows (`Workflow`, `WorkflowCtx`): journaled `step` and `agent` calls, resume after
@@ -12,6 +18,28 @@ All notable changes to Cairn are documented here. The format follows
 - Multi-agent orchestration: `sequential`, `concurrent`, `handoff` and `group_chat` (round-robin
   or manager-selected).
 - `AgentTool`: use an agent as another agent's tool; the child's spend is charged to the parent.
+- `Middleware`: `before_model`, `after_model`, `before_tool` and `after_tool` hooks to inspect,
+  rewrite or refuse each step; rewrites are what get journaled.
+- OpenTelemetry: `invoke_agent`, `chat` and `execute_tool` spans with GenAI semantic-convention
+  attributes; `cairn::otel::init` exports them over OTLP/HTTP (feature `otel`).
+- `cairn-server`: host agents behind an HTTP API (start, inspect, time-travel, approve, resume), with
+  API-key auth, a crash-recovery loop that resumes orphaned runs, and a built-in Dev UI at `/ui`.
+- `cairn ui <dir>`: browse a directory of JSONL journals in the Dev UI.
+- Model connectors: Azure OpenAI (`azure:` spec; API keys or Microsoft Entra ID tokens), Amazon
+  Bedrock (`bedrock:` spec; Converse and ConverseStream with SigV4 or Bedrock API keys, prompt
+  caching), and a native Gemini adapter (thought signatures, streaming) that also serves Vertex AI.
+- Context engine (`ContextPolicy`): request-time trimming of older tool results, and journaled
+  compaction of older turns by a summarizer model, with its cost counted toward budgets.
+- Long-term memory: `MemoryStore` with `InMemoryMemory` and `PostgresMemory` (full-text search),
+  `memory_tools` (`remember` / `recall`) and `RecallMiddleware` for automatic recall.
+- `cairn-ai-a2a` (feature `a2a`): Agent2Agent protocol 1.0 over JSON-RPC. `A2aServer` serves an
+  agent (agent card, `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`,
+  `SubscribeToTask`, bearer-key auth); `A2aClient` calls any A2A agent; `A2aTool` makes a remote A2A
+  agent a tool. Checked against the official A2A Python SDK in both directions.
+- Multi-turn runs: `Agent::continue_run` / `continue_message` add a follow-up message to a finished
+  run (`UserMessage` event); the run's budget covers every turn.
+- `Agent::cancel` stops a run that is not being driven (`RunCanceled` event, `Status::Canceled`).
+- `Journal::list_runs` (in-memory, JSONL and PostgreSQL journals).
 - `ToolCtx::charge` and `ToolCtx::remaining_usd` for tools that spend money; tool spend is journaled
   on `ToolCompleted` and counts toward budgets.
 

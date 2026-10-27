@@ -21,7 +21,7 @@ time-travel debugging.
 ```toml
 [dependencies]
 cairn = { package = "cairn-ai", version = "0.1" }
-# optional features: "postgres" (PostgresJournal), "mcp" (MCP client)
+# optional features: "postgres" (PostgresJournal), "mcp" (MCP client), "a2a" (A2A server/client)
 # latest main instead: cairn = { package = "cairn-ai", git = "https://github.com/whatstask/Cairn" }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -66,8 +66,12 @@ cargo run -p cairn-ai-cli -- state runs/<run_id>.jsonl --at 3   # state at event
 
 Model specs: `anthropic:…`, `openai:…`, `gemini:…`, `ollama:…`, `openrouter:…`
 (keys from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`),
-and `compat:<name>:<model>` for any OpenAI-compatible server — e.g.
-`compat:k2:IFM/K2-Horizon-375B-A23B` reads `K2_BASE_URL` and `K2_API_KEY`.
+`azure:<deployment>` (Azure OpenAI: `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`), `bedrock:<model-id>`
+(Amazon Bedrock Converse API, SigV4 or `AWS_BEARER_TOKEN_BEDROCK`; region from `AWS_REGION`), and
+`compat:<name>:<model>` for any OpenAI-compatible server — e.g.
+`compat:k2:IFM/K2-Horizon-375B-A23B` reads `K2_BASE_URL` and `K2_API_KEY`. In code:
+`OpenAiCompatModel::azure_entra(..)` for Microsoft Entra ID tokens, `GeminiModel::vertex(..)` for
+Vertex AI, and `BedrockAuth::Provider(..)` to plug in any AWS credential source.
 
 ### Streaming and Postgres
 
@@ -130,6 +134,66 @@ child agent that was mid-run, and a child waiting for approval suspends the whol
 `group_chat` (round-robin or manager-selected). Any agent can also be a tool of another with
 `AgentTool::new(agent, "research", "…")`; the child's spend is charged to the parent's budget.
 
+### Middleware and OpenTelemetry
+
+```rust
+struct Compliance;
+
+#[async_trait]
+impl Middleware for Compliance {
+    async fn before_model(&self, _: &HookCtx, req: &mut ModelRequest) -> Result<(), String> {
+        redact_pii(req); Ok(())                                   // rewrite what the provider sees
+    }
+    async fn before_tool(&self, _: &HookCtx, tool: &ToolSpec, input: &mut Value) -> Result<(), String> {
+        if tool.name == "refund" && input["amount"].as_f64() > Some(1000.0) {
+            return Err("refunds over $1000 need a manager".into());   // denied; the model is told why
+        }
+        Ok(())
+    }
+}
+
+let agent = Agent::builder("billing").model(model).middleware(Compliance).build()?;
+let _otel = cairn::otel::init("http://localhost:4318/v1/traces", "billing-worker")?;   // features = ["otel"]
+```
+
+Hooks: `before_model`, `after_model`, `before_tool`, `after_tool`; what they rewrite is what gets
+journaled. Every run emits `invoke_agent`, `chat` and `execute_tool` spans with OpenTelemetry GenAI
+attributes (`gen_ai.request.model`, `gen_ai.usage.*`, `gen_ai.tool.name`, plus `cairn.cost_usd`), so
+any OTLP backend — Datadog, Grafana, Honeycomb, Jaeger, Azure Monitor — shows them.
+
+### Hosting and the Dev UI
+
+```rust
+cairn_server::Server::new(journal)                 // same journal for every replica (e.g. Postgres)
+    .agent(support).agent(billing)
+    .api_key(std::env::var("CAIRN_API_KEY")?)
+    .recover_every(Duration::from_secs(30))        // resume runs whose worker died
+    .serve("0.0.0.0:8790").await?;                 // Dev UI at /ui
+```
+
+HTTP API: start runs (`POST /v1/agents/{name}/runs`), list and inspect them, read the journal,
+time-travel (`/v1/runs/{id}/state?at=N`), approve or reject (`POST /v1/runs/{id}/approvals/{call}`),
+resume, and list pending approvals. The Dev UI shows runs, costs, a clickable timeline with the state
+at every event, and an approval inbox. Browse any JSONL journal directory without code:
+`cairn ui ./runs`.
+
+### Long runs and memory
+
+```rust
+let agent = Agent::builder("researcher")
+    .model(model)
+    .context(ContextPolicy::default()
+        .max_tool_result_chars(2_000)       // shorten old tool results in requests (journal keeps them whole)
+        .compact_at(120_000)                // past this, summarize older turns — journaled and budgeted
+        .summarize_with(cheap_model))
+    .tools(memory_tools(store.clone(), "customer-42"))           // `remember` / `recall`
+    .middleware(RecallMiddleware::new(store, "customer-42"))     // auto-add relevant notes
+    .build()?;
+```
+
+Stores: `InMemoryMemory` (keyword ranking) and `PostgresMemory` (full-text search, feature
+`postgres`); implement `MemoryStore` for a vector database.
+
 ### MCP tools
 
 ```rust
@@ -147,6 +211,44 @@ Stdio servers: `McpClient::connect_stdio("npx", &["-y", "some-mcp-server"], env)
 from MCP annotations (`readOnlyHint` → Read, `destructiveHint: false` → Write, otherwise Irreversible,
 which requires approval by default). Credentials stay in the client; every call carries Cairn's
 idempotency key in `_meta`.
+
+### A2A: talk to agents from any framework
+
+Serve a Cairn agent over the [Agent2Agent protocol](https://a2a-protocol.org) (1.0, JSON-RPC
+binding), so agents built with other frameworks or by other companies can call it:
+
+```rust
+// features = ["a2a"]
+use cairn::a2a::{A2aServer, AgentSkill};
+
+A2aServer::new(support_agent, "https://agents.example.com/a2a")
+    .description("Answers order and billing questions.")
+    .skill(AgentSkill::new("orders", "Order lookup", "Find and explain orders").tags(["support"]))
+    .api_key(std::env::var("A2A_KEY")?)
+    .serve("0.0.0.0:8791")
+    .await?;
+```
+
+Each A2A conversation is a durable Cairn run, and each task is one turn of it, so conversations survive
+restarts and keep their budgets, approvals and audit trail. A client that retries its first message
+gets the same task back instead of starting a second run. Tool calls that need approval wait for an
+operator, or with `.client_approvals(true)` the A2A client answers "approve" or "deny".
+
+Going the other way, a remote A2A agent can be a tool for a Cairn agent:
+
+```rust
+use cairn::a2a::{A2aClient, A2aTool};
+
+let travel = Arc::new(A2aClient::discover("https://travel.example.com", [("authorization", key)]).await?);
+let agent = Agent::builder("planner")
+    .model(model)
+    .tool(A2aTool::new(travel).effect(Effect::Read).timeout(Duration::from_secs(300)))
+    .build()?;
+```
+
+Checked against the official A2A Python SDK in both directions: its client calling a Cairn agent, and
+Cairn's client calling an agent it serves. Push notifications, gRPC and the REST binding are not
+supported yet.
 
 ### Evals by replay
 
@@ -186,12 +288,14 @@ in-memory journal.
 | Crate | Purpose |
 |---|---|
 | `cairn-runtime` | Events, journal, state fold, agent loop, tools, policy, budgets |
-| `cairn-models` | Anthropic (native) and OpenAI-compatible adapters (OpenAI, Gemini, Ollama, vLLM, OpenRouter…) |
+| `cairn-models` | Native Anthropic, Gemini (incl. Vertex AI) and Amazon Bedrock adapters; OpenAI-compatible adapter (OpenAI, Azure OpenAI, Ollama, vLLM, OpenRouter…) |
 | `cairn-ai` | Facade crate users depend on (`use cairn::prelude::*`) |
 | `cairn-gateway` | Drop-in OpenAI/Anthropic-compatible gateway: budgets, allowlists, failover, audit |
-| `cairn-journal-postgres` | PostgreSQL journal: many processes/machines can drive, approve and resume the same runs |
+| `cairn-journal-postgres` | PostgreSQL journal and memory: many processes/machines can drive, approve and resume the same runs |
 | `cairn-ai-mcp` | MCP client (stdio + Streamable HTTP): any MCP server's tools as Cairn tools |
-| `cairn-ai-cli` | `cairn show` / `cairn state` journal inspector |
+| `cairn-server` | HTTP API, crash-recovery worker and Dev UI for hosting agents |
+| `cairn-ai-a2a` | Agent2Agent (A2A 1.0): serve Cairn agents to any A2A client; remote A2A agents as tools |
+| `cairn-ai-cli` | `cairn show` / `cairn state` / `cairn ui` journal tools |
 
 ## Roadmap
 
@@ -203,14 +307,17 @@ Done in 0.1:
 - Run leases, `run_with_id`, budget hardening, usability-checked fallback, `finish_schema`
 - MCP client (stdio + Streamable HTTP), evals by replay, per-tool timeouts, `compat:` model specs
 - Durable workflows: sequential, concurrent, handoff and group-chat orchestration; agents as tools
+- Middleware hooks; OpenTelemetry GenAI spans with an OTLP exporter
+- `cairn-server`: HTTP API, crash-recovery worker, Dev UI; `cairn ui` for any journal directory
+- Connectors: Azure OpenAI (keys or Entra ID), Amazon Bedrock (SigV4, streaming), native Gemini and Vertex AI
+- Context engine (journaled compaction, tool-result trimming) and long-term memory (tools, auto-recall, Postgres)
+- A2A 1.0 server and client; multi-turn runs (`continue_run`) and run cancellation
 
 Next:
 
 - [ ] Gateway spend shared across replicas (Postgres-backed)
 - [ ] Parallel execution of read-only tools; tool retries
-- [ ] Context engine: compaction policies, token budgets per section
 - [ ] Per-agent credential brokering for MCP (OAuth)
-- [ ] OpenTelemetry GenAI spans
 
 ## Contributing
 

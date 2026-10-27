@@ -7,12 +7,19 @@
 //!   Groq, Together and most self-hosted servers.
 
 mod anthropic;
+mod bedrock;
+mod eventstream;
+mod gemini;
 mod openai;
+mod sigv4;
 mod sse;
 
 pub use anthropic::AnthropicModel;
+pub use bedrock::{BedrockAuth, BedrockModel};
 pub use cairn_runtime::{Priced, Pricing};
-pub use openai::OpenAiCompatModel;
+pub use gemini::GeminiModel;
+pub use openai::{AZURE_API_VERSION, OpenAiCompatModel, TokenProvider};
+pub use sigv4::AwsCredentials;
 
 use std::sync::Arc;
 
@@ -25,9 +32,11 @@ use cairn_runtime::{Model, ModelError};
 /// |--------------|---------------------|-------------------------------------------|
 /// | `anthropic:` | `ANTHROPIC_API_KEY` | api.anthropic.com                         |
 /// | `openai:`    | `OPENAI_API_KEY`    | api.openai.com                            |
-/// | `gemini:`    | `GEMINI_API_KEY`    | Gemini OpenAI-compatible endpoint         |
+/// | `gemini:`    | `GEMINI_API_KEY`    | Gemini API (native, with thought signatures) |
 /// | `ollama:`    | —                   | `OLLAMA_BASE_URL` or localhost:11434      |
 /// | `openrouter:`| `OPENROUTER_API_KEY`| openrouter.ai                             |
+/// | `azure:<deployment>` | `AZURE_OPENAI_API_KEY` | `AZURE_OPENAI_ENDPOINT` (+ optional `AZURE_OPENAI_API_VERSION`) |
+/// | `bedrock:<model-id>` | `AWS_BEARER_TOKEN_BEDROCK`, or `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`) | `AWS_REGION` / `AWS_DEFAULT_REGION` |
 /// | `compat:<name>:` | `<NAME>_API_KEY` (optional) | `<NAME>_BASE_URL` (required)  |
 ///
 /// `compat:` reaches any OpenAI-compatible server: `compat:k2:IFM/K2-Horizon-375B-A23B`
@@ -41,8 +50,16 @@ pub fn from_spec(spec: &str) -> Result<Arc<dyn Model>, ModelError> {
     let model: Arc<dyn Model> = match provider {
         "anthropic" => Arc::new(AnthropicModel::new(model, key("ANTHROPIC_API_KEY")?)),
         "openai" => Arc::new(OpenAiCompatModel::openai(model, key("OPENAI_API_KEY")?)),
-        "gemini" => Arc::new(OpenAiCompatModel::gemini(model, key("GEMINI_API_KEY")?)),
+        "gemini" => Arc::new(GeminiModel::new(model, key("GEMINI_API_KEY")?)),
         "openrouter" => Arc::new(OpenAiCompatModel::openrouter(model, key("OPENROUTER_API_KEY")?)),
+        "azure" => {
+            let m = OpenAiCompatModel::azure(key("AZURE_OPENAI_ENDPOINT")?, model, key("AZURE_OPENAI_API_KEY")?);
+            match std::env::var("AZURE_OPENAI_API_VERSION") {
+                Ok(v) if !v.is_empty() => Arc::new(m.with_api_version(v)),
+                _ => Arc::new(m),
+            }
+        }
+        "bedrock" => Arc::new(BedrockModel::from_env(model)?),
         "compat" => {
             let (name, model) = model
                 .split_once(':')

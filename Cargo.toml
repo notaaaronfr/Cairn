@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
-members = ["crates/cairn-runtime", "crates/cairn-models", "crates/cairn-ai", "crates/cairn-cli", "crates/cairn-gateway", "crates/cairn-journal-postgres", "crates/cairn-mcp"]
+members = ["crates/cairn-runtime", "crates/cairn-models", "crates/cairn-ai", "crates/cairn-cli", "crates/cairn-gateway", "crates/cairn-journal-postgres", "crates/cairn-mcp", "crates/cairn-server", "crates/cairn-a2a"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 authors = ["Aaron David Charles"]
 homepage = "https://github.com/whatstask/Cairn"
 repository = "https://github.com/whatstask/Cairn"
@@ -14,19 +14,26 @@ license = "Apache-2.0"
 rust-version = "1.85"
 
 [workspace.dependencies]
-cairn-runtime = { path = "crates/cairn-runtime", version = "0.1.0" }
-cairn-models = { path = "crates/cairn-models", version = "0.1.0" }
-cairn-ai = { path = "crates/cairn-ai", version = "0.1.0" }
-cairn-gateway = { path = "crates/cairn-gateway", version = "0.1.0" }
-cairn-journal-postgres = { path = "crates/cairn-journal-postgres", version = "0.1.0" }
-cairn-ai-mcp = { path = "crates/cairn-mcp", version = "0.1.0" }
+cairn-runtime = { path = "crates/cairn-runtime", version = "0.2.0" }
+cairn-models = { path = "crates/cairn-models", version = "0.2.0" }
+cairn-ai = { path = "crates/cairn-ai", version = "0.2.0" }
+cairn-gateway = { path = "crates/cairn-gateway", version = "0.2.0" }
+cairn-journal-postgres = { path = "crates/cairn-journal-postgres", version = "0.2.0" }
+cairn-ai-mcp = { path = "crates/cairn-mcp", version = "0.2.0" }
+cairn-server = { path = "crates/cairn-server", version = "0.2.0" }
+cairn-ai-a2a = { path = "crates/cairn-a2a", version = "0.2.0" }
 
 async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 clap = { version = "4", features = ["derive"] }
+opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+tracing-opentelemetry = "0.34"
 hex = "0.4"
+hmac = "0.12"
 jsonschema = { version = "0.60", default-features = false }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 schemars = "1"

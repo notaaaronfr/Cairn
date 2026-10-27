@@ -15,11 +15,15 @@ pub enum Status {
     Completed { output: String },
     Failed { error: String },
     BudgetExceeded { reason: String },
+    Canceled { reason: String },
 }
 
 impl Status {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Status::Completed { .. } | Status::Failed { .. } | Status::BudgetExceeded { .. })
+        matches!(
+            self,
+            Status::Completed { .. } | Status::Failed { .. } | Status::BudgetExceeded { .. } | Status::Canceled { .. }
+        )
     }
 }
 
@@ -147,6 +151,16 @@ impl RunState {
                 self.status = Status::Completed { output: output.clone() };
                 self.structured_output = structured.clone();
             }
+            EventKind::ContextCompacted { replaced, summary, usage, cost_usd } => {
+                self.usage.add(usage);
+                self.cost_usd += cost_usd.unwrap_or(0.0);
+                let end = (1 + replaced).min(self.messages.len());
+                self.messages.drain(1..end);
+                if let Some(task) = self.messages.first_mut() {
+                    task.content
+                        .push(Content::Text { text: format!("\n\n[Summary of earlier work in this run]\n{summary}") });
+                }
+            }
             EventKind::FinishRejected { reason, .. } => {
                 self.finish_rejections += 1;
                 self.messages.push(Message::user(format!(
@@ -156,6 +170,25 @@ impl RunState {
             }
             EventKind::RunFailed { error } => {
                 self.status = Status::Failed { error: error.clone() };
+            }
+            EventKind::RunCanceled { reason, .. } => {
+                self.status = Status::Canceled { reason: reason.clone() };
+                for p in &mut self.pending {
+                    p.awaiting_approval = false;
+                }
+            }
+            EventKind::UserMessage { message } => {
+                self.status = Status::Running;
+                self.structured_output = None;
+                self.finish_rejections = 0;
+                self.pending.clear();
+                self.tool_results.clear();
+                // Keep roles alternating: a run that failed after tool results
+                // ends on a user turn, so the new text joins it.
+                match self.messages.last_mut() {
+                    Some(last) if last.role == Role::User => last.content.extend(message.content.iter().cloned()),
+                    _ => self.messages.push(message.clone()),
+                }
             }
             EventKind::WorkflowStarted { workflow, .. } => {
                 self.agent = workflow.clone();

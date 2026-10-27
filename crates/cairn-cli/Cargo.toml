@@ -18,5 +18,7 @@ doc = false
 
 [dependencies]
 cairn-runtime.workspace = true
+cairn-server.workspace = true
+tokio.workspace = true
 clap.workspace = true
 serde_json.workspace = true

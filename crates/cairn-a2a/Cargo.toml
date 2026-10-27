@@ -1,0 +1,34 @@
+[package]
+name = "cairn-ai-a2a"
+description = "Agent2Agent (A2A 1.0) protocol for Cairn: serve Cairn agents to any A2A client, and call remote A2A agents as tools."
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "cairn_a2a"
+
+[dependencies]
+cairn-runtime.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+schemars.workspace = true
