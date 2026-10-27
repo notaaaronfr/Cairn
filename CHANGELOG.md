@@ -26,6 +26,10 @@ All notable changes to Cairn are documented here. The format follows
 - Model connectors: Azure OpenAI (`azure:` spec; API keys or Microsoft Entra ID tokens), Amazon
   Bedrock (`bedrock:` spec; Converse and ConverseStream with SigV4 or Bedrock API keys, prompt
   caching), and a native Gemini adapter (thought signatures, streaming) that also serves Vertex AI.
+- Context engine (`ContextPolicy`): request-time trimming of older tool results, and journaled
+  compaction of older turns by a summarizer model, with its cost counted toward budgets.
+- Long-term memory: `MemoryStore` with `InMemoryMemory` and `PostgresMemory` (full-text search),
+  `memory_tools` (`remember` / `recall`) and `RecallMiddleware` for automatic recall.
 - `Journal::list_runs` (in-memory, JSONL and PostgreSQL journals).
 - `ToolCtx::charge` and `ToolCtx::remaining_usd` for tools that spend money; tool spend is journaled
   on `ToolCompleted` and counts toward budgets.

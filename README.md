@@ -177,6 +177,23 @@ resume, and list pending approvals. The Dev UI shows runs, costs, a clickable ti
 at every event, and an approval inbox. Browse any JSONL journal directory without code:
 `cairn ui ./runs`.
 
+### Long runs and memory
+
+```rust
+let agent = Agent::builder("researcher")
+    .model(model)
+    .context(ContextPolicy::default()
+        .max_tool_result_chars(2_000)       // shorten old tool results in requests (journal keeps them whole)
+        .compact_at(120_000)                // past this, summarize older turns — journaled and budgeted
+        .summarize_with(cheap_model))
+    .tools(memory_tools(store.clone(), "customer-42"))           // `remember` / `recall`
+    .middleware(RecallMiddleware::new(store, "customer-42"))     // auto-add relevant notes
+    .build()?;
+```
+
+Stores: `InMemoryMemory` (keyword ranking) and `PostgresMemory` (full-text search, feature
+`postgres`); implement `MemoryStore` for a vector database.
+
 ### MCP tools
 
 ```rust
@@ -236,7 +253,7 @@ in-memory journal.
 | `cairn-models` | Native Anthropic, Gemini (incl. Vertex AI) and Amazon Bedrock adapters; OpenAI-compatible adapter (OpenAI, Azure OpenAI, Ollama, vLLM, OpenRouter…) |
 | `cairn-ai` | Facade crate users depend on (`use cairn::prelude::*`) |
 | `cairn-gateway` | Drop-in OpenAI/Anthropic-compatible gateway: budgets, allowlists, failover, audit |
-| `cairn-journal-postgres` | PostgreSQL journal: many processes/machines can drive, approve and resume the same runs |
+| `cairn-journal-postgres` | PostgreSQL journal and memory: many processes/machines can drive, approve and resume the same runs |
 | `cairn-ai-mcp` | MCP client (stdio + Streamable HTTP): any MCP server's tools as Cairn tools |
 | `cairn-server` | HTTP API, crash-recovery worker and Dev UI for hosting agents |
 | `cairn-ai-cli` | `cairn show` / `cairn state` / `cairn ui` journal tools |
@@ -254,12 +271,12 @@ Done in 0.1:
 - Middleware hooks; OpenTelemetry GenAI spans with an OTLP exporter
 - `cairn-server`: HTTP API, crash-recovery worker, Dev UI; `cairn ui` for any journal directory
 - Connectors: Azure OpenAI (keys or Entra ID), Amazon Bedrock (SigV4, streaming), native Gemini and Vertex AI
+- Context engine (journaled compaction, tool-result trimming) and long-term memory (tools, auto-recall, Postgres)
 
 Next:
 
 - [ ] Gateway spend shared across replicas (Postgres-backed)
 - [ ] Parallel execution of read-only tools; tool retries
-- [ ] Context engine: compaction policies, token budgets per section
 - [ ] Per-agent credential brokering for MCP (OAuth)
 
 ## Contributing

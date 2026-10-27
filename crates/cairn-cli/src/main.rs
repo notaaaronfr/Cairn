@@ -129,6 +129,9 @@ fn summary(kind: &EventKind) -> String {
         ),
         EventKind::BudgetExceeded { reason } => reason.clone(),
         EventKind::RunCompleted { output, .. } => format!("{:?}", truncate(output, 70)),
+        EventKind::ContextCompacted { replaced, summary, .. } => {
+            format!("replaced {replaced} messages → {}", truncate(summary, 70))
+        }
         EventKind::FinishRejected { step, reason } => format!("step={step} {}", truncate(reason, 80)),
         EventKind::RunFailed { error } => truncate(error, 80),
         EventKind::WorkflowStarted { workflow, input } => {

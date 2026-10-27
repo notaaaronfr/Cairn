@@ -6,6 +6,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 
 use crate::budget::Budget;
+use crate::context::ContextPolicy;
 use crate::event::{Event, EventKind};
 use crate::journal::{InMemoryJournal, Journal, JournalError};
 use crate::lease::Lease;
@@ -93,6 +94,7 @@ pub struct Agent {
     worker_id: String,
     lease_ttl: Duration,
     middleware: Vec<Arc<dyn Middleware>>,
+    context: ContextPolicy,
 }
 
 /// Default lease length; renewed every third of it while a run is driven.
@@ -147,6 +149,7 @@ impl Agent {
             worker_id: None,
             lease_ttl: DEFAULT_LEASE_TTL,
             middleware: Vec::new(),
+            context: ContextPolicy::default(),
         }
     }
 
@@ -175,6 +178,7 @@ impl Agent {
             worker_id: Some(self.worker_id.clone()),
             lease_ttl: self.lease_ttl,
             middleware: self.middleware.clone(),
+            context: self.context.clone(),
         }
     }
 
@@ -352,7 +356,7 @@ impl Agent {
         }
     }
 
-    async fn model_turn(&self, state: &mut RunState) -> Result<(), AgentError> {
+    fn build_request(&self, state: &RunState) -> ModelRequest {
         let mut request = ModelRequest {
             system: self.system_prompt(),
             messages: state.messages.clone(),
@@ -361,6 +365,54 @@ impl Agent {
             temperature: self.temperature,
             provider_options: self.provider_options.clone(),
         };
+        self.context.trim(&mut request);
+        request
+    }
+
+    /// Replace older turns with a journaled summary if the request is too
+    /// large. Returns `Ok(false)` when the run must stop (budget).
+    async fn compact_if_needed(&self, state: &mut RunState, request: &ModelRequest) -> Result<bool, AgentError> {
+        if !self.context.should_compact(estimate_input_tokens(request)) {
+            return Ok(true);
+        }
+        let Some(cut) = self.context.compaction_cut(&state.messages) else {
+            tracing::warn!(run_id = %state.run_id, "context is over the compaction threshold but nothing can be compacted");
+            return Ok(true);
+        };
+        let model: &dyn Model = match self.context.summarizer() {
+            Some(m) => m.as_ref(),
+            None => self.model.as_ref(),
+        };
+        let older = &state.messages[1..1 + cut];
+        let est = serde_json::to_string(older).map_or(0, |s| s.len() as u64).div_ceil(3);
+        let max_tokens = match self
+            .budget
+            .output_cap(2048, state.usage.total(), state.cost_usd, est, |i, o| model.max_call_cost(i, o))
+        {
+            Ok(cap) => cap,
+            Err(reason) => {
+                self.emit(state, EventKind::BudgetExceeded { reason }).await?;
+                return Ok(false);
+            }
+        };
+        match crate::context::summarize(model, older, max_tokens).await {
+            Ok((summary, usage, cost_usd)) => {
+                let kind = EventKind::ContextCompacted { replaced: cut, summary, usage, cost_usd };
+                self.emit(state, kind).await?;
+            }
+            Err(e) => tracing::warn!(run_id = %state.run_id, error = %e, "context compaction failed; continuing"),
+        }
+        Ok(true)
+    }
+
+    async fn model_turn(&self, state: &mut RunState) -> Result<(), AgentError> {
+        let mut request = self.build_request(state);
+        if !self.compact_if_needed(state, &request).await? {
+            return Ok(());
+        }
+        if state.messages.len() != request.messages.len() {
+            request = self.build_request(state);
+        }
         // Shrink this step's answer limit to what the remaining budget can
         // pay for, so one call cannot overshoot it.
         let est_input = estimate_input_tokens(&request);
@@ -655,6 +707,7 @@ pub struct AgentBuilder {
     worker_id: Option<String>,
     lease_ttl: Duration,
     middleware: Vec<Arc<dyn Middleware>>,
+    context: ContextPolicy,
 }
 
 impl AgentBuilder {
@@ -692,6 +745,13 @@ impl AgentBuilder {
     /// Add several tools at once (e.g. all tools from an MCP server).
     pub fn tools<T: Tool + 'static>(mut self, tools: impl IntoIterator<Item = T>) -> Self {
         self.tools.extend(tools.into_iter().map(|t| Arc::new(t) as Arc<dyn Tool>));
+        self
+    }
+
+    /// How long runs stay within the context window: trimming of old tool
+    /// results and journaled compaction of older turns.
+    pub fn context(mut self, policy: ContextPolicy) -> Self {
+        self.context = policy;
         self
     }
 
@@ -806,7 +866,10 @@ impl AgentBuilder {
     pub fn build(self) -> Result<Agent, AgentError> {
         let model = self.model.ok_or_else(|| AgentError::Config("a model is required".into()))?;
         if self.budget.max_usd.is_some() {
-            let unpriced = model.unpriced_models();
+            let mut unpriced = model.unpriced_models();
+            if let Some(summarizer) = self.context.summarizer() {
+                unpriced.extend(summarizer.unpriced_models());
+            }
             if !unpriced.is_empty() {
                 return Err(AgentError::Config(format!(
                     "max_usd is set but these models have no pricing, so spend could not be counted: {}. \
@@ -847,6 +910,7 @@ impl AgentBuilder {
             worker_id: self.worker_id.unwrap_or_else(|| format!("worker-{}", uuid::Uuid::now_v7())),
             lease_ttl: self.lease_ttl,
             middleware: self.middleware,
+            context: self.context,
         })
     }
 }
