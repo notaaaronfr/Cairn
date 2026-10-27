@@ -36,6 +36,8 @@ pub enum AgentError {
     Leased { run_id: String, owner: String, expires_at: chrono::DateTime<chrono::Utc> },
     #[error("lost the lease on run `{run_id}`; another worker may have taken over")]
     LeaseLost { run_id: String },
+    #[error("run `{0}` has not finished; only a finished run can take a follow-up message")]
+    NotFinished(String),
 }
 
 /// Result of driving a run until it finishes or needs a human.
@@ -252,6 +254,59 @@ impl Agent {
             Ok(state) => self.drive(state, &lease).instrument(self.run_span(run_id)).await,
             Err(e) => Err(e),
         };
+        self.end_lease(run_id, lease).await;
+        result
+    }
+
+    /// Continue a finished run with a follow-up user message and drive it:
+    /// a multi-turn conversation on one durable run. The model sees the
+    /// whole history (subject to the agent's [`ContextPolicy`]), and the
+    /// run's budget covers every turn.
+    ///
+    /// Fails with [`AgentError::NotFinished`] while the run is still running
+    /// or awaiting approval.
+    pub async fn continue_run(&self, run_id: &str, input: impl Into<String>) -> Result<RunOutcome, AgentError> {
+        self.continue_message(run_id, Message::user(input)).await
+    }
+
+    pub async fn continue_message(&self, run_id: &str, input: Message) -> Result<RunOutcome, AgentError> {
+        let lease = self.take_lease(run_id).await?;
+        let result = async {
+            let mut state = self.state(run_id).await?;
+            if state.agent != self.name {
+                return Err(AgentError::Config(format!(
+                    "run `{run_id}` belongs to `{}`, not agent `{}`",
+                    state.agent, self.name
+                )));
+            }
+            if !state.status.is_terminal() {
+                return Err(AgentError::NotFinished(run_id.to_owned()));
+            }
+            self.emit(&mut state, EventKind::UserMessage { message: input }).await?;
+            self.drive(state, &lease).await
+        }
+        .instrument(self.run_span(run_id))
+        .await;
+        self.end_lease(run_id, lease).await;
+        result
+    }
+
+    /// Stop a run that is not being driven right now (e.g. one awaiting
+    /// approval, or one whose worker died). Fails with [`AgentError::Leased`]
+    /// while a worker is driving it, and with [`AgentError::Config`] if the
+    /// run has already finished.
+    pub async fn cancel(&self, run_id: &str, reason: &str, by: Option<&str>) -> Result<RunOutcome, AgentError> {
+        let lease = self.take_lease(run_id).await?;
+        let result = async {
+            let mut state = self.state(run_id).await?;
+            if state.status.is_terminal() {
+                return Err(AgentError::Config(format!("run `{run_id}` has already finished")));
+            }
+            let kind = EventKind::RunCanceled { reason: reason.to_owned(), by: by.map(str::to_owned) };
+            self.emit(&mut state, kind).await?;
+            Ok(RunOutcome::from_state(&state))
+        }
+        .await;
         self.end_lease(run_id, lease).await;
         result
     }

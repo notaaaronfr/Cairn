@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/cairn-runtime", "crates/cairn-models", "crates/cairn-ai", "crates/cairn-cli", "crates/cairn-gateway", "crates/cairn-journal-postgres", "crates/cairn-mcp", "crates/cairn-server"]
+members = ["crates/cairn-runtime", "crates/cairn-models", "crates/cairn-ai", "crates/cairn-cli", "crates/cairn-gateway", "crates/cairn-journal-postgres", "crates/cairn-mcp", "crates/cairn-server", "crates/cairn-a2a"]
 
 [workspace.package]
 version = "0.2.0"
@@ -21,6 +21,7 @@ cairn-gateway = { path = "crates/cairn-gateway", version = "0.2.0" }
 cairn-journal-postgres = { path = "crates/cairn-journal-postgres", version = "0.2.0" }
 cairn-ai-mcp = { path = "crates/cairn-mcp", version = "0.2.0" }
 cairn-server = { path = "crates/cairn-server", version = "0.2.0" }
+cairn-ai-a2a = { path = "crates/cairn-a2a", version = "0.2.0" }
 
 async-trait = "0.1"
 axum = "0.8"

@@ -34,6 +34,12 @@ pub mod mcp {
     pub use cairn_mcp::*;
 }
 
+/// Agent2Agent (A2A 1.0) server and client (enable the `a2a` feature).
+#[cfg(feature = "a2a")]
+pub mod a2a {
+    pub use cairn_a2a::*;
+}
+
 /// OpenTelemetry export (enable the `otel` feature).
 #[cfg(feature = "otel")]
 pub mod otel;

@@ -21,7 +21,7 @@ time-travel debugging.
 ```toml
 [dependencies]
 cairn = { package = "cairn-ai", version = "0.1" }
-# optional features: "postgres" (PostgresJournal), "mcp" (MCP client)
+# optional features: "postgres" (PostgresJournal), "mcp" (MCP client), "a2a" (A2A server/client)
 # latest main instead: cairn = { package = "cairn-ai", git = "https://github.com/whatstask/Cairn" }
 tokio = { version = "1", features = ["full"] }
 ```
@@ -212,6 +212,44 @@ from MCP annotations (`readOnlyHint` → Read, `destructiveHint: false` → Writ
 which requires approval by default). Credentials stay in the client; every call carries Cairn's
 idempotency key in `_meta`.
 
+### A2A: talk to agents from any framework
+
+Serve a Cairn agent over the [Agent2Agent protocol](https://a2a-protocol.org) (1.0, JSON-RPC
+binding), so agents built with other frameworks or by other companies can call it:
+
+```rust
+// features = ["a2a"]
+use cairn::a2a::{A2aServer, AgentSkill};
+
+A2aServer::new(support_agent, "https://agents.example.com/a2a")
+    .description("Answers order and billing questions.")
+    .skill(AgentSkill::new("orders", "Order lookup", "Find and explain orders").tags(["support"]))
+    .api_key(std::env::var("A2A_KEY")?)
+    .serve("0.0.0.0:8791")
+    .await?;
+```
+
+Each A2A conversation is a durable Cairn run, and each task is one turn of it, so conversations survive
+restarts and keep their budgets, approvals and audit trail. A client that retries its first message
+gets the same task back instead of starting a second run. Tool calls that need approval wait for an
+operator, or with `.client_approvals(true)` the A2A client answers "approve" or "deny".
+
+Going the other way, a remote A2A agent can be a tool for a Cairn agent:
+
+```rust
+use cairn::a2a::{A2aClient, A2aTool};
+
+let travel = Arc::new(A2aClient::discover("https://travel.example.com", [("authorization", key)]).await?);
+let agent = Agent::builder("planner")
+    .model(model)
+    .tool(A2aTool::new(travel).effect(Effect::Read).timeout(Duration::from_secs(300)))
+    .build()?;
+```
+
+Checked against the official A2A Python SDK in both directions: its client calling a Cairn agent, and
+Cairn's client calling an agent it serves. Push notifications, gRPC and the REST binding are not
+supported yet.
+
 ### Evals by replay
 
 ```rust
@@ -256,6 +294,7 @@ in-memory journal.
 | `cairn-journal-postgres` | PostgreSQL journal and memory: many processes/machines can drive, approve and resume the same runs |
 | `cairn-ai-mcp` | MCP client (stdio + Streamable HTTP): any MCP server's tools as Cairn tools |
 | `cairn-server` | HTTP API, crash-recovery worker and Dev UI for hosting agents |
+| `cairn-ai-a2a` | Agent2Agent (A2A 1.0): serve Cairn agents to any A2A client; remote A2A agents as tools |
 | `cairn-ai-cli` | `cairn show` / `cairn state` / `cairn ui` journal tools |
 
 ## Roadmap
@@ -272,6 +311,7 @@ Done in 0.1:
 - `cairn-server`: HTTP API, crash-recovery worker, Dev UI; `cairn ui` for any journal directory
 - Connectors: Azure OpenAI (keys or Entra ID), Amazon Bedrock (SigV4, streaming), native Gemini and Vertex AI
 - Context engine (journaled compaction, tool-result trimming) and long-term memory (tools, auto-recall, Postgres)
+- A2A 1.0 server and client; multi-turn runs (`continue_run`) and run cancellation
 
 Next:
 

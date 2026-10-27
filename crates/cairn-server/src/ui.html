@@ -37,7 +37,7 @@
   .muted { color: var(--muted); }
   .mono { font-family: var(--mono); font-size: 12.5px; }
   .pill { font-size: 11.5px; padding: 1px 8px; border-radius: 99px; background: var(--chip); white-space: nowrap; }
-  .pill.completed { color: var(--ok); } .pill.failed, .pill.budget_exceeded { color: var(--bad); }
+  .pill.completed { color: var(--ok); } .pill.failed, .pill.budget_exceeded { color: var(--bad); } .pill.canceled { color: var(--muted); }
   .pill.awaiting_approval { color: var(--warn); } .pill.running { color: var(--accent); }
   section { padding: 16px 20px; overflow: auto; }
   .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin: 12px 0; }
@@ -165,6 +165,7 @@ function summary(ev) {
   const k = ev.kind;
   switch (k.type) {
     case "run_started": return "input: " + (k.input.content.find((c) => c.type === "text") || {}).text;
+    case "user_message": return "input: " + (k.message.content.find((c) => c.type === "text") || {}).text;
     case "model_called": return k.response.content.map((c) => c.type === "text" ? JSON.stringify(c.text.slice(0, 80)) : c.type === "tool_use" ? "call " + c.name : c.type).join(", ")
       + ` · ${k.response.usage.input_tokens + k.response.usage.output_tokens} tok` + (k.cost_usd != null ? " · " + money(k.cost_usd) : "") + ` · ${k.duration_ms}ms`;
     case "tool_completed": return `${k.tool}${k.is_error ? " ERROR" : ""} → ` + JSON.stringify(k.output).slice(0, 100);
