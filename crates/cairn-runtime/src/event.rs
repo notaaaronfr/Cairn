@@ -62,6 +62,11 @@ pub enum EventKind {
         output: Value,
         is_error: bool,
         duration_ms: u64,
+        /// Model usage the tool reported (e.g. a sub-agent's).
+        #[serde(default, skip_serializing_if = "is_zero_usage")]
+        usage: Usage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
     },
     BudgetExceeded {
         reason: String,
@@ -80,6 +85,29 @@ pub enum EventKind {
     RunFailed {
         error: String,
     },
+    /// First event of a workflow run.
+    WorkflowStarted {
+        workflow: String,
+        input: Value,
+    },
+    /// A workflow step finished; replays return this instead of re-running it.
+    StepCompleted {
+        step: String,
+        output: Value,
+        is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        child_run: Option<String>,
+        #[serde(default, skip_serializing_if = "is_zero_usage")]
+        usage: Usage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cost_usd: Option<f64>,
+    },
+    WorkflowCompleted {
+        output: Value,
+    },
+    WorkflowFailed {
+        error: String,
+    },
 }
 
 impl EventKind {
@@ -96,6 +124,14 @@ impl EventKind {
             EventKind::RunCompleted { .. } => "run_completed",
             EventKind::FinishRejected { .. } => "finish_rejected",
             EventKind::RunFailed { .. } => "run_failed",
+            EventKind::WorkflowStarted { .. } => "workflow_started",
+            EventKind::StepCompleted { .. } => "step_completed",
+            EventKind::WorkflowCompleted { .. } => "workflow_completed",
+            EventKind::WorkflowFailed { .. } => "workflow_failed",
         }
     }
+}
+
+fn is_zero_usage(u: &Usage) -> bool {
+    *u == Usage::default()
 }

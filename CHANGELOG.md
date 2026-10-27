@@ -6,6 +6,15 @@ All notable changes to Cairn are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- Durable workflows (`Workflow`, `WorkflowCtx`): journaled `step` and `agent` calls, resume after
+  crashes and approvals, workflow-wide USD budgets that cap each child agent.
+- Multi-agent orchestration: `sequential`, `concurrent`, `handoff` and `group_chat` (round-robin
+  or manager-selected).
+- `AgentTool`: use an agent as another agent's tool; the child's spend is charged to the parent.
+- `ToolCtx::charge` and `ToolCtx::remaining_usd` for tools that spend money; tool spend is journaled
+  on `ToolCompleted` and counts toward budgets.
+
 ## [0.1.0] — 2026-10-26
 
 First public release.
