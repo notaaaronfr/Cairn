@@ -990,3 +990,69 @@ async fn run_with_id_refuses_ids_that_are_not_plain_names() {
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "nothing was written");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn finished_run_continues_with_a_follow_up_message() {
+    let model = Arc::new(ScriptedModel::new(vec![
+        text_response("Paris"),
+        tool_call_response(&[("c1", "lookup", json!({"id": 2}))]),
+        text_response("about 2.1 million"),
+    ]));
+    let calls = Arc::new(AtomicU32::new(0));
+    let agent = Agent::builder("t")
+        .model(model.clone())
+        .tool(counting_tool("lookup", Effect::Read, calls.clone()))
+        .build()
+        .unwrap();
+
+    let first = agent.run_with_id("chat-1", "Capital of France?").await.unwrap();
+    assert_eq!(first.output(), Some("Paris"));
+
+    let second = agent.continue_run("chat-1", "Population?").await.unwrap();
+    assert_eq!(second.output(), Some("about 2.1 million"));
+    assert_eq!(second.steps, 3, "steps count across turns");
+
+    // The follow-up request carries the whole conversation.
+    let req = &model.requests()[1];
+    let texts: Vec<String> = req.messages.iter().map(|m| m.text()).collect();
+    assert_eq!(texts, ["Capital of France?", "Paris", "Population?"]);
+
+    // Rebuilt from the journal, the state agrees.
+    let state = agent.state("chat-1").await.unwrap();
+    assert_eq!(state.messages.len(), 6);
+    assert_eq!(state.status, Status::Completed { output: "about 2.1 million".into() });
+}
+
+#[tokio::test]
+async fn unfinished_run_refuses_a_follow_up_message() {
+    let model = Arc::new(ScriptedModel::new(vec![tool_call_response(&[("r1", "refund", json!({"id": 1}))])]));
+    let agent = Agent::builder("t")
+        .model(model)
+        .tool(counting_tool("refund", Effect::Irreversible, Arc::default()))
+        .build()
+        .unwrap();
+    let out = agent.run_with_id("r", "refund it").await.unwrap();
+    assert_eq!(out.status, Status::AwaitingApproval);
+    assert!(matches!(agent.continue_run("r", "hello?").await, Err(AgentError::NotFinished(_))));
+    assert!(matches!(agent.continue_run("missing", "hi").await, Err(AgentError::UnknownRun(_))));
+}
+
+#[tokio::test]
+async fn run_awaiting_approval_can_be_canceled() {
+    let model = Arc::new(ScriptedModel::new(vec![tool_call_response(&[("r1", "refund", json!({"id": 1}))])]));
+    let calls = Arc::new(AtomicU32::new(0));
+    let agent = Agent::builder("t")
+        .model(model)
+        .tool(counting_tool("refund", Effect::Irreversible, calls.clone()))
+        .build()
+        .unwrap();
+    agent.run_with_id("r", "refund it").await.unwrap();
+
+    let out = agent.cancel("r", "customer withdrew the request", Some("ops")).await.unwrap();
+    assert_eq!(out.status, Status::Canceled { reason: "customer withdrew the request".into() });
+    assert!(out.awaiting_approval.is_empty());
+    assert!(matches!(agent.cancel("r", "again", None).await, Err(AgentError::Config(_))));
+    // A canceled run is finished: resuming does nothing, and the tool never ran.
+    assert_eq!(agent.resume("r").await.unwrap().status, out.status);
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+}

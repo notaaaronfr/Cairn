@@ -134,6 +134,8 @@ fn summary(kind: &EventKind) -> String {
         }
         EventKind::FinishRejected { step, reason } => format!("step={step} {}", truncate(reason, 80)),
         EventKind::RunFailed { error } => truncate(error, 80),
+        EventKind::RunCanceled { reason, by } => format!("{reason} (by {})", by.as_deref().unwrap_or("?")),
+        EventKind::UserMessage { message } => format!("input={:?}", truncate(&message.text(), 60)),
         EventKind::WorkflowStarted { workflow, input } => {
             format!("workflow={workflow} input={}", truncate(&input.to_string(), 60))
         }

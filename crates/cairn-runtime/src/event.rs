@@ -95,6 +95,16 @@ pub enum EventKind {
     RunFailed {
         error: String,
     },
+    /// The run was stopped on request before it finished.
+    RunCanceled {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        by: Option<String>,
+    },
+    /// A follow-up user message continuing a finished run (multi-turn).
+    UserMessage {
+        message: Message,
+    },
     /// First event of a workflow run.
     WorkflowStarted {
         workflow: String,
@@ -135,6 +145,8 @@ impl EventKind {
             EventKind::FinishRejected { .. } => "finish_rejected",
             EventKind::ContextCompacted { .. } => "context_compacted",
             EventKind::RunFailed { .. } => "run_failed",
+            EventKind::UserMessage { .. } => "user_message",
+            EventKind::RunCanceled { .. } => "run_canceled",
             EventKind::WorkflowStarted { .. } => "workflow_started",
             EventKind::StepCompleted { .. } => "step_completed",
             EventKind::WorkflowCompleted { .. } => "workflow_completed",

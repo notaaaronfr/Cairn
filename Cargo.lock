@@ -289,6 +289,7 @@ name = "cairn-ai"
 version = "0.2.0"
 dependencies = [
  "axum",
+ "cairn-ai-a2a",
  "cairn-ai-mcp",
  "cairn-journal-postgres",
  "cairn-models",
@@ -303,6 +304,27 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cairn-ai-a2a"
+version = "0.2.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cairn-runtime",
+ "chrono",
+ "futures",
+ "hex",
+ "reqwest 0.12.28",
+ "schemars",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

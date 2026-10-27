@@ -7,6 +7,8 @@ All notable changes to Cairn are documented here. The format follows
 ## [Unreleased] — 0.2.0
 
 ### Changed
+- `Status` has a new `Canceled` variant and `AgentError` a new `NotFinished` variant; exhaustive
+  matches on either need a new arm.
 - `gemini:` model specs now use the native Gemini API instead of its OpenAI-compatible endpoint,
   so thought signatures survive multi-step tool use. `OpenAiCompatModel::gemini` remains available.
 
@@ -30,6 +32,13 @@ All notable changes to Cairn are documented here. The format follows
   compaction of older turns by a summarizer model, with its cost counted toward budgets.
 - Long-term memory: `MemoryStore` with `InMemoryMemory` and `PostgresMemory` (full-text search),
   `memory_tools` (`remember` / `recall`) and `RecallMiddleware` for automatic recall.
+- `cairn-ai-a2a` (feature `a2a`): Agent2Agent protocol 1.0 over JSON-RPC. `A2aServer` serves an
+  agent (agent card, `SendMessage`, `SendStreamingMessage`, `GetTask`, `ListTasks`, `CancelTask`,
+  `SubscribeToTask`, bearer-key auth); `A2aClient` calls any A2A agent; `A2aTool` makes a remote A2A
+  agent a tool. Checked against the official A2A Python SDK in both directions.
+- Multi-turn runs: `Agent::continue_run` / `continue_message` add a follow-up message to a finished
+  run (`UserMessage` event); the run's budget covers every turn.
+- `Agent::cancel` stops a run that is not being driven (`RunCanceled` event, `Status::Canceled`).
 - `Journal::list_runs` (in-memory, JSONL and PostgreSQL journals).
 - `ToolCtx::charge` and `ToolCtx::remaining_usd` for tools that spend money; tool spend is journaled
   on `ToolCompleted` and counts toward budgets.

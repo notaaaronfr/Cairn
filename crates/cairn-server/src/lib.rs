@@ -201,6 +201,7 @@ fn status_name(s: &Status) -> &'static str {
         Status::Completed { .. } => "completed",
         Status::Failed { .. } => "failed",
         Status::BudgetExceeded { .. } => "budget_exceeded",
+        Status::Canceled { .. } => "canceled",
     }
 }
 
@@ -209,7 +210,7 @@ fn summarize(events: &[Event]) -> Option<RunSummary> {
     let (output, error) = match &state.status {
         Status::Completed { output } => (Some(output.clone()), None),
         Status::Failed { error } => (None, Some(error.clone())),
-        Status::BudgetExceeded { reason } => (None, Some(reason.clone())),
+        Status::BudgetExceeded { reason } | Status::Canceled { reason } => (None, Some(reason.clone())),
         _ => (None, None),
     };
     let kind = match events.first().map(|e| &e.kind) {
@@ -242,7 +243,7 @@ fn outcome_json(o: &RunOutcome) -> Value {
         "tokens": o.usage.total(),
         "cost_usd": o.cost_usd,
         "awaiting_approval": o.awaiting_approval,
-        "error": match &o.status { Status::Failed { error } => Some(error.clone()), Status::BudgetExceeded { reason } => Some(reason.clone()), _ => None },
+        "error": match &o.status { Status::Failed { error } => Some(error.clone()), Status::BudgetExceeded { reason } | Status::Canceled { reason } => Some(reason.clone()), _ => None },
     })
 }
 
