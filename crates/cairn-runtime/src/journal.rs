@@ -43,6 +43,12 @@ pub trait Journal: Send + Sync {
     async fn append(&self, event: &Event) -> Result<(), JournalError>;
     async fn load(&self, run_id: &str) -> Result<Vec<Event>, JournalError>;
 
+    /// Run ids, most recently active first, at most `limit`. Journals that
+    /// cannot enumerate runs return an empty list.
+    async fn list_runs(&self, _limit: usize) -> Result<Vec<String>, JournalError> {
+        Ok(Vec::new())
+    }
+
     /// Take (or re-take) the lease on `run_id` for `ttl`. Returns the current
     /// holder if another live owner has it.
     async fn acquire_lease(
@@ -130,6 +136,14 @@ impl Journal for InMemoryJournal {
         Ok(self.runs.lock().await.get(run_id).cloned().unwrap_or_default())
     }
 
+    async fn list_runs(&self, limit: usize) -> Result<Vec<String>, JournalError> {
+        let runs = self.runs.lock().await;
+        let mut ids: Vec<(DateTime<Utc>, &String)> =
+            runs.iter().filter_map(|(id, events)| events.last().map(|e| (e.at, id))).collect();
+        ids.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(b.1)));
+        Ok(ids.into_iter().take(limit).map(|(_, id)| id.clone()).collect())
+    }
+
     async fn acquire_lease(
         &self,
         run_id: &str,
@@ -206,6 +220,23 @@ impl Journal for JsonlJournal {
 
         seqs.insert(event.run_id.clone(), expected + 1);
         Ok(())
+    }
+
+    async fn list_runs(&self, limit: usize) -> Result<Vec<String>, JournalError> {
+        let mut entries = tokio::fs::read_dir(&self.dir).await?;
+        let mut runs = Vec::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let modified = entry.metadata().await?.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                runs.push((modified, stem.to_owned()));
+            }
+        }
+        runs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        Ok(runs.into_iter().take(limit).map(|(_, id)| id).collect())
     }
 
     async fn load(&self, run_id: &str) -> Result<Vec<Event>, JournalError> {

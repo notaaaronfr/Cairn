@@ -1,0 +1,30 @@
+[package]
+name = "cairn-server"
+description = "HTTP API, crash-recovery worker and Dev UI for hosting Cairn agents."
+version.workspace = true
+authors.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+cairn-runtime.workspace = true
+axum.workspace = true
+chrono.workspace = true
+hex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+serde.workspace = true
+reqwest.workspace = true
+schemars.workspace = true
