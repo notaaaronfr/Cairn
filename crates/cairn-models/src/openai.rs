@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use cairn_runtime::{
     Content, Model, ModelError, ModelRequest, ModelResponse, ModelStream, Role, StopReason, StreamEvent, Usage,
@@ -7,12 +9,28 @@ use serde_json::{Value, json};
 use crate::sse::{self, SseEvent};
 use crate::{Pricing, merge_options, result_string, send_json};
 
+/// Default Azure OpenAI data-plane API version (GA).
+pub const AZURE_API_VERSION: &str = "2024-10-21";
+
 /// Chat Completions adapter for any OpenAI-compatible endpoint.
+/// Supplies a fresh bearer token per request (e.g. a Microsoft Entra ID
+/// token from your credential cache).
+pub type TokenProvider = Arc<dyn Fn() -> Result<String, String> + Send + Sync>;
+
+#[derive(Clone)]
+enum Auth {
+    None,
+    Bearer(String),
+    Header(&'static str, String),
+    Token(TokenProvider),
+}
+
 pub struct OpenAiCompatModel {
     provider: String,
     model: String,
     base_url: String,
-    api_key: Option<String>,
+    auth: Auth,
+    query: Vec<(String, String)>,
     max_tokens_field: &'static str,
     pricing: Option<Pricing>,
     client: reqwest::Client,
@@ -31,7 +49,8 @@ impl OpenAiCompatModel {
             provider: provider.into(),
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_owned(),
-            api_key,
+            auth: api_key.map_or(Auth::None, Auth::Bearer),
+            query: Vec::new(),
             max_tokens_field: "max_tokens",
             pricing: None,
             client: reqwest::Client::new(),
@@ -46,6 +65,54 @@ impl OpenAiCompatModel {
 
     pub fn gemini(model: impl Into<String>, api_key: impl Into<String>) -> Self {
         Self::new("gemini", model, "https://generativelanguage.googleapis.com/v1beta/openai", Some(api_key.into()))
+    }
+
+    /// Azure OpenAI deployment with an API key. `endpoint` is the resource
+    /// URL, e.g. `https://my-resource.openai.azure.com`.
+    pub fn azure(endpoint: impl Into<String>, deployment: impl Into<String>, api_key: impl Into<String>) -> Self {
+        let mut m = Self::azure_base(endpoint.into(), deployment.into());
+        m.auth = Auth::Header("api-key", api_key.into());
+        m
+    }
+
+    /// Azure OpenAI deployment authenticated with Microsoft Entra ID: `token`
+    /// is called before every request and should return a cached, valid
+    /// access token for `https://cognitiveservices.azure.com/.default`.
+    pub fn azure_entra(
+        endpoint: impl Into<String>,
+        deployment: impl Into<String>,
+        token: impl Fn() -> Result<String, String> + Send + Sync + 'static,
+    ) -> Self {
+        let mut m = Self::azure_base(endpoint.into(), deployment.into());
+        m.auth = Auth::Token(Arc::new(token));
+        m
+    }
+
+    fn azure_base(endpoint: String, deployment: String) -> Self {
+        let base = format!("{}/openai/deployments/{deployment}", endpoint.trim_end_matches('/'));
+        let mut m = Self::new("azure", deployment, base, None);
+        m.max_tokens_field = "max_completion_tokens";
+        m.query.push(("api-version".into(), AZURE_API_VERSION.into()));
+        m
+    }
+
+    /// Override the Azure OpenAI `api-version` (default [`AZURE_API_VERSION`]).
+    pub fn with_api_version(mut self, version: impl Into<String>) -> Self {
+        self.query.retain(|(k, _)| k != "api-version");
+        self.query.push(("api-version".into(), version.into()));
+        self
+    }
+
+    /// POST to `<base>/chat/completions` with this model's auth and query.
+    fn post(&self) -> Result<reqwest::RequestBuilder, ModelError> {
+        let mut http = self.client.post(format!("{}/chat/completions", self.base_url)).query(&self.query);
+        http = match &self.auth {
+            Auth::None => http,
+            Auth::Bearer(key) => http.bearer_auth(key),
+            Auth::Header(name, value) => http.header(*name, value),
+            Auth::Token(provider) => http.bearer_auth(provider().map_err(ModelError::Other)?),
+        };
+        Ok(http)
     }
 
     pub fn openrouter(model: impl Into<String>, api_key: impl Into<String>) -> Self {
@@ -210,11 +277,7 @@ impl Model for OpenAiCompatModel {
 
     async fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
         let body = self.build_body(request);
-        let mut http = self.client.post(format!("{}/chat/completions", self.base_url));
-        if let Some(key) = &self.api_key {
-            http = http.bearer_auth(key);
-        }
-        let v = send_json(http, &body).await?;
+        let v = send_json(self.post()?, &body).await?;
         self.parse_response(&v)
     }
 
@@ -222,11 +285,7 @@ impl Model for OpenAiCompatModel {
         let mut body = self.build_body(request);
         body["stream"] = json!(true);
         body["stream_options"] = json!({ "include_usage": true });
-        let mut http = self.client.post(format!("{}/chat/completions", self.base_url));
-        if let Some(key) = &self.api_key {
-            http = http.bearer_auth(key);
-        }
-        let resp = http.json(&body).send().await.map_err(|e| ModelError::Transport(e.to_string()))?;
+        let resp = self.post()?.json(&body).send().await.map_err(|e| ModelError::Transport(e.to_string()))?;
         let resp = sse::check_status(resp).await?;
         let acc = StreamAcc { provider: self.provider.clone(), model: self.model.clone(), ..Default::default() };
         Ok(sse::translate(sse::events(resp), acc, StreamAcc::step, StreamAcc::end))

@@ -66,8 +66,12 @@ cargo run -p cairn-ai-cli -- state runs/<run_id>.jsonl --at 3   # state at event
 
 Model specs: `anthropic:…`, `openai:…`, `gemini:…`, `ollama:…`, `openrouter:…`
 (keys from `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`),
-and `compat:<name>:<model>` for any OpenAI-compatible server — e.g.
-`compat:k2:IFM/K2-Horizon-375B-A23B` reads `K2_BASE_URL` and `K2_API_KEY`.
+`azure:<deployment>` (Azure OpenAI: `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`), `bedrock:<model-id>`
+(Amazon Bedrock Converse API, SigV4 or `AWS_BEARER_TOKEN_BEDROCK`; region from `AWS_REGION`), and
+`compat:<name>:<model>` for any OpenAI-compatible server — e.g.
+`compat:k2:IFM/K2-Horizon-375B-A23B` reads `K2_BASE_URL` and `K2_API_KEY`. In code:
+`OpenAiCompatModel::azure_entra(..)` for Microsoft Entra ID tokens, `GeminiModel::vertex(..)` for
+Vertex AI, and `BedrockAuth::Provider(..)` to plug in any AWS credential source.
 
 ### Streaming and Postgres
 
@@ -229,7 +233,7 @@ in-memory journal.
 | Crate | Purpose |
 |---|---|
 | `cairn-runtime` | Events, journal, state fold, agent loop, tools, policy, budgets |
-| `cairn-models` | Anthropic (native) and OpenAI-compatible adapters (OpenAI, Gemini, Ollama, vLLM, OpenRouter…) |
+| `cairn-models` | Native Anthropic, Gemini (incl. Vertex AI) and Amazon Bedrock adapters; OpenAI-compatible adapter (OpenAI, Azure OpenAI, Ollama, vLLM, OpenRouter…) |
 | `cairn-ai` | Facade crate users depend on (`use cairn::prelude::*`) |
 | `cairn-gateway` | Drop-in OpenAI/Anthropic-compatible gateway: budgets, allowlists, failover, audit |
 | `cairn-journal-postgres` | PostgreSQL journal: many processes/machines can drive, approve and resume the same runs |
@@ -249,6 +253,7 @@ Done in 0.1:
 - Durable workflows: sequential, concurrent, handoff and group-chat orchestration; agents as tools
 - Middleware hooks; OpenTelemetry GenAI spans with an OTLP exporter
 - `cairn-server`: HTTP API, crash-recovery worker, Dev UI; `cairn ui` for any journal directory
+- Connectors: Azure OpenAI (keys or Entra ID), Amazon Bedrock (SigV4, streaming), native Gemini and Vertex AI
 
 Next:
 
